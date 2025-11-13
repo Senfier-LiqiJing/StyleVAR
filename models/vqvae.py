@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 
-from .basic_vae import Decoder, Encoder
-from .quant import VectorQuantizer2
+from basic_vae import Decoder, Encoder
+from quant import VectorQuantizer2
 
 
 class VQVAE(nn.Module):
