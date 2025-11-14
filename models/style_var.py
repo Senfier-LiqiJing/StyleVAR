@@ -10,7 +10,7 @@ import dist
 from models.style_basic_var import AdaLNBeforeHead, AdaLNCrossAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
-
+import torchvision.models as models
 
 class SharedAdaLin(nn.Linear):
     def forward(self, cond_BD):
@@ -22,7 +22,7 @@ class VAR(nn.Module):
     def __init__(
         self, vae_local: VQVAE,
         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-        norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
+        norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1, style_enc_dim = 512,
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
@@ -50,6 +50,12 @@ class VAR(nn.Module):
         self.num_stages_minus_1 = len(self.patch_nums) - 1
         self.rng = torch.Generator(device=dist.get_device())
         
+        # define style/ content encoder
+        self.style_enc_dim = style_enc_dim
+        self.style_encoder = nn.Sequential(*list(models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1).children())[:-1])
+        self.content_encoder = nn.Sequential(*list(models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1).children())[:-1])
+        self.feat_emb = nn.Linear(self.style_enc_dim,self.C)
+
         # 1. input (word) embedding
         quant: VectorQuantizer2 = vae_local.quantize
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
@@ -156,10 +162,10 @@ class VAR(nn.Module):
         
         # style-var relys on input images for generation
         # sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
-        sos = cond_BD = self.style_emb(style_img_fea) + self.content_emb(content_img_fea) # sos: 1D -> 1C
+        sos = self.feat_emb(self.content_encoder(content_img).squeeze(-1).squeeze(-1))
+        cond_BD = self.feat_emb(self.style_encoder(style_img).squeeze(-1).squeeze(-1))
         
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC  # lvl_embed: 1L -> 1LC, pos_1LC:1LC, lvl_pos:1LC
-        # sos: 1C -> 11C -> 2B,1,C   pos_start: 11C -> 2B,1,C
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         
         # encode the style & content image
@@ -210,7 +216,7 @@ class VAR(nn.Module):
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
-    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor, style_BLCvae: torch.Tensor, content_BLCvae: torch.tensor) -> torch.Tensor:  # returns logits_BLV
+    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor, style_BLCvae: torch.Tensor, content_BLCvae: torch.tensor, style_img:torch.tensor, content_img:torch.tensor) -> torch.Tensor:  # returns logits_BLV
         """
         :param label_B: label_B
         :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
@@ -221,8 +227,10 @@ class VAR(nn.Module):
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
         with torch.cuda.amp.autocast(enabled=False):
-            label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
-            sos = cond_BD = self.class_emb(label_B)
+            #label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
+            #sos = cond_BD = self.class_emb(label_B)
+            sos = self.feat_emb(self.content_encoder(content_img).squeeze(-1).squeeze(-1))
+            cond_BD = self.feat_emb(self.style_encoder(style_img).squeeze(-1).squeeze(-1))
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
             
             if self.prog_si == 0: x_BLC = sos
@@ -319,17 +327,19 @@ class VARHF(VAR, PyTorchModelHubMixin):
         self,
         vae_kwargs,
         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-        norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
+        norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,style_enc_dim = 512,
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
+        alpha_nums = (0.2,0.3,0.4,0.4,0.5,0.5,0.6,0.6,0.7,0.8) # 10 alpha numbers
     ):
         vae_local = VQVAE(**vae_kwargs)
         super().__init__(
             vae_local=vae_local,
             num_classes=num_classes, depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate,
-            norm_eps=norm_eps, shared_aln=shared_aln, cond_drop_rate=cond_drop_rate,
+            norm_eps=norm_eps, shared_aln=shared_aln, cond_drop_rate=cond_drop_rate,style_enc_dim = style_enc_dim,
             attn_l2_norm=attn_l2_norm,
             patch_nums=patch_nums,
             flash_if_available=flash_if_available, fused_if_available=fused_if_available,
+            alpha_nums = alpha_nums
         )
