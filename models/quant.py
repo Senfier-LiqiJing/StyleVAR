@@ -190,6 +190,56 @@ class VectorQuantizer2(nn.Module):
             next_scales.append(F.interpolate(f_hat, size=(pn_next, pn_next), mode='area').view(B, C, -1).transpose(1, 2))
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
     
+    # ===================== msBllist_to_BlCvae: used in style image decomposition =====================
+    def msBllist_to_BlCvae(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
+        next_scales = []
+        B = gt_ms_idx_Bl[0].shape[0]
+        C = self.Cvae
+        H = W = self.v_patch_nums[-1]
+        SN = len(self.v_patch_nums)
+
+        # l is the actual input list length for this call
+        l = len(gt_ms_idx_Bl)
+        
+        f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
+
+        # Loop iterations are now controlled by 'l', the input length
+        for si in range(l):
+            # Keep original progressive training logic
+            if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break
+            if si >= SN:
+                break
+            pn_current: int = self.v_patch_nums[si]
+            h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn_current, pn_current), size=(H, W), mode='bicubic')
+            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
+            next_scales.append(F.interpolate(f_hat, size=(pn_current, pn_current), mode='area').view(B, C, -1).transpose(1, 2))      
+        return torch.cat(next_scales, dim=1) if len(next_scales) else None    # cat BlCs to BLC, this should be float32
+
+# ===================== msBllist_to_BlCv_list: used in style image decomposition =====================
+    def msBllist_to_BlCv_list(self, gt_ms_idx_Bl: List[torch.Tensor]) -> torch.Tensor:
+        next_scales = []
+        B = gt_ms_idx_Bl[0].shape[0]
+        C = self.Cvae
+        H = W = self.v_patch_nums[-1]
+        SN = len(self.v_patch_nums)
+
+        # l is the actual input list length for this call
+        l = len(gt_ms_idx_Bl)
+        
+        f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
+
+        # Loop iterations are now controlled by 'l', the input length
+        for si in range(l):
+            # Keep original progressive training logic
+            if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break
+            if si >= SN:
+                break
+            pn_current: int = self.v_patch_nums[si]
+            h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn_current, pn_current), size=(H, W), mode='bicubic')
+            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
+            next_scales.append(F.interpolate(f_hat, size=(pn_current, pn_current), mode='area').view(B, C, -1).transpose(1, 2))      
+        return next_scales
+
     # ===================== get_next_autoregressive_input: only used in VAR inference, for getting next step's input =====================
     def get_next_autoregressive_input(self, si: int, SN: int, f_hat: torch.Tensor, h_BChw: torch.Tensor) -> Tuple[Optional[torch.Tensor], torch.Tensor]: # only used in VAR inference
         HW = self.v_patch_nums[-1]

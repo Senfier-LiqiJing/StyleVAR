@@ -5,6 +5,13 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
+import os
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
 
 import dist
 from models.style_basic_var import AdaLNBeforeHead, AdaLNCrossAttn
@@ -18,7 +25,7 @@ class SharedAdaLin(nn.Linear):
         return super().forward(cond_BD).view(-1, 1, 6, C)   # B16C
 
 
-class VAR(nn.Module):
+class StyleVAR(nn.Module):
     def __init__(
         self, vae_local: VQVAE,
         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
@@ -133,7 +140,7 @@ class VAR(nn.Module):
     
     @torch.no_grad()
     def autoregressive_infer_cfg(
-        self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
+        self, B: int,
         style_img: torch.Tensor, content_img: torch.Tensor, # B,3,H,W in [0,1]
         g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
         more_smooth=False,
@@ -155,10 +162,10 @@ class VAR(nn.Module):
         else: self.rng.manual_seed(g_seed); rng = self.rng
         
         # style-var relys on input images for generation, not class
-        '''if label_B is None:
-            label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
-        elif isinstance(label_B, int):
-            label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)'''
+        #if label_B is None:
+        #    label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
+        #elif isinstance(label_B, int):
+        #    label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
         # style-var relys on input images for generation
         # sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
@@ -170,10 +177,24 @@ class VAR(nn.Module):
         
         # encode the style & content image
         ms_style_idx = self.vae_proxy[0].img_to_idxBl(style_img)
-        ms_style_BlC = [self.word_embed(self.vae_proxy[0].quantize.embedding(idx_Bl)) for idx_Bl in ms_style_idx]
+        ms_style_BlCv = self.vae_quant_proxy[0].msBllist_to_BlCv_list(ms_style_idx)
+        ms_style_BlC = [self.word_embed(item) for item in ms_style_BlCv]
         ms_content_idx = self.vae_proxy[0].img_to_idxBl(content_img)
-        ms_content_BlC = [self.word_embed(self.vae_proxy[0].quantize.embedding(idx_Bl)) for idx_Bl in ms_content_idx]
+        ms_content_BlCv = self.vae_quant_proxy[0].msBllist_to_BlCv_list(ms_content_idx)
+        ms_content_BlC = [self.word_embed(item) for item in ms_content_BlCv]
         
+        cur_L = 0
+        for idx, style_BlC in enumerate(ms_style_BlC):
+            style_BlC += lvl_pos[:,cur_L:cur_L+self.patch_nums[idx]**2]
+            ms_style_BlC[idx] = style_BlC.expand(2*B,self.patch_nums[idx]**2,-1)
+            cur_L += self.patch_nums[idx]**2
+        
+        cur_L = 0
+        for idx, content_BlC in enumerate(ms_content_BlC):
+            content_BlC += lvl_pos[:,cur_L:cur_L+self.patch_nums[idx]**2]
+            ms_content_BlC[idx] = content_BlC.expand(2*B,self.patch_nums[idx]**2,-1)
+            cur_L += self.patch_nums[idx]**2
+
         cur_L = 0
         # f_hat: B,Cvae,16,16
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
@@ -216,7 +237,7 @@ class VAR(nn.Module):
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
-    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor, style_BLCvae: torch.Tensor, content_BLCvae: torch.tensor, style_img:torch.tensor, content_img:torch.tensor) -> torch.Tensor:  # returns logits_BLV
+    def forward(self, x_BLCv_wo_first_l: torch.Tensor, style_BLCvae: torch.Tensor, content_BLCvae: torch.tensor, style_img:torch.tensor, content_img:torch.tensor) -> torch.Tensor:  # returns logits_BLV
         """
         :param label_B: label_B
         :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
@@ -233,10 +254,16 @@ class VAR(nn.Module):
             cond_BD = self.feat_emb(self.style_encoder(style_img).squeeze(-1).squeeze(-1))
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
             
-            if self.prog_si == 0: x_BLC = sos
-            else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+            if self.prog_si == 0: 
+                x_BLC = sos
+            else: 
+                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+                style_BLC = self.word_embed(style_BLCvae)
+                content_BLC = self.word_embed(content_BLCvae)
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
-        
+            style_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
+            content_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
+
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
         
@@ -250,7 +277,7 @@ class VAR(nn.Module):
         
         AdaLNCrossAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, style= self.word_embed(style_BLCvae), content = self.word_embed(content_BLCvae), cond_BD=cond_BD_or_gss, attn_bias=attn_bias,alpha = alpha_nums[i])
+            x_BLC = b(x=x_BLC, style=style_BLC, content=content_BLC , cond_BD=cond_BD_or_gss, attn_bias=attn_bias,alpha = alpha_nums[i])
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
         
         if self.prog_si == 0:
@@ -320,7 +347,7 @@ class VAR(nn.Module):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
 
-class VARHF(VAR, PyTorchModelHubMixin):
+class VARHF(StyleVAR, PyTorchModelHubMixin):
             # repo_url="https://github.com/FoundationVision/VAR",
             # tags=["image-generation"]):
     def __init__(
