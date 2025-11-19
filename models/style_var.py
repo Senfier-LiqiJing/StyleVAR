@@ -71,10 +71,10 @@ class StyleVAR(nn.Module):
         
         # 2. class embedding
         init_std = math.sqrt(1 / self.C / 3)
-        self.num_classes = num_classes
-        self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
-        self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
-        nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
+        #self.num_classes = num_classes
+        #self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
+        #self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
+        # nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
         
@@ -275,9 +275,17 @@ class StyleVAR(nn.Module):
         cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
         
+        # alpha in training should be a tensor, since multi-stage logits is output simultanously and no single alpha should be allowd.
+        # alpha in inference only need to take one scalar.
+        alpha_map_tensor = torch.tensor(self.alpha_nums, device=x_BLC.device, dtype=x_BLC.dtype)
+        lvls_1_ed = self.lvl_1L[:, :ed]
+        lvls_B_ed = lvls_1_ed.expand(B, -1)
+        alpha_tensor_B_ed = alpha_map_tensor[lvls_B_ed]
+        alpha_tensor_BLC = alpha_tensor_B_ed.unsqueeze(-1)
+
         AdaLNCrossAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, style=style_BLC, content=content_BLC , cond_BD=cond_BD_or_gss, attn_bias=attn_bias,alpha = alpha_nums[i])
+            x_BLC = b(x=x_BLC, style=style_BLC, content=content_BLC , cond_BD=cond_BD_or_gss, attn_bias=attn_bias,alpha = alpha_tensor_BLC)
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
         
         if self.prog_si == 0:

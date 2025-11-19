@@ -23,14 +23,18 @@ import dist
 
 
 class Args(Tap):
-    data_path: str = '/path/to/imagenet'
-    exp_name: str = 'text'
+    #data_path: str = '/path/to/imagenet'
+    #data_path: str = '/home/OmniStyle-150k-tensor'
+    data_path: str = '/home/OmniStyle-150K'
+    exp_name: str = 'style_var'
+    clean_ckpt_path: str = '/home/PML-Project/local_output/style_var_d20_clean_fp32.pth' # this path does not contain vqvae or trainer state
+    vanilla_ckpt_path:str = "/home/PML-Project/checkpoints/var_d20.pth"
     
     # VAE
     vfast: int = 0      # torch.compile VAE; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'
     # VAR
     tfast: int = 0      # torch.compile VAR; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'
-    depth: int = 16     # VAR depth
+    depth: int = 20     # VAR depth
     # VAR initialization
     ini: float = -1     # -1: automated model parameter initialization
     hd: float = 0.02    # head.w *= hd
@@ -45,12 +49,12 @@ class Args(Tap):
     tclip: float = 2.       # <=0 for not using grad clip
     ls: float = 0.0         # label smooth
     
-    bs: int = 768           # global batch size
+    bs: int = 128           # global batch size
     batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size() / 8) * 8
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
-    ac: int = 1             # gradient accumulation
+    ac: int = 16             # gradient accumulation
     
-    ep: int = 250
+    ep: int = 2
     wp: float = 0
     wp0: float = 0.005      # initial lr ratio at the begging of lr warm up
     wpe: float = 0.01       # final lr ratio at the end of training
@@ -82,9 +86,8 @@ class Args(Tap):
     
     # would be automatically set in runtime
     cmd: str = ' '.join(sys.argv[1:])  # [automatically set; don't specify this]
-    branch: str = subprocess.check_output(f'git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]' # [automatically set; don't specify this]
-    commit_id: str = subprocess.check_output(f'git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]'  # [automatically set; don't specify this]
-    commit_msg: str = (subprocess.check_output(f'git log -1', shell=True).decode('utf-8').strip().splitlines() or ['[unknown]'])[-1].strip()    # [automatically set; don't specify this]
+    # branch: str = subprocess.check_output(f'git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]' # [automatically set; don't specify this]    commit_id: str = subprocess.check_output(f'git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]'  # [automatically set; don't specify this]
+    # commit_msg: str = (subprocess.check_output(f'git log -1', shell=True).decode('utf-8').strip().splitlines() or ['[unknown]'])[-1].strip()    # [automatically set; don't specify this]
     acc_mean: float = None      # [automatically set; don't specify this]
     acc_tail: float = None      # [automatically set; don't specify this]
     L_mean: float = None        # [automatically set; don't specify this]
@@ -179,7 +182,15 @@ class Args(Tap):
             return
         if '1/' in self.cur_ep: # first time to dump log
             with open(self.log_txt_path, 'w') as fp:
-                json.dump({'is_master': dist.is_master(), 'name': self.exp_name, 'cmd': self.cmd, 'commit': self.commit_id, 'branch': self.branch, 'tb_log_dir_path': self.tb_log_dir_path}, fp, indent=0)
+                json_content = {
+                    'is_master': dist.is_master(), 
+                    'name': getattr(self, 'exp_name', 'unknown'), 
+                    'cmd': getattr(self, 'cmd', 'unknown'), 
+                    'commit': getattr(self, 'commit_id', 'unknown'), # <--- 修复点
+                    'branch': getattr(self, 'branch', 'unknown'), 
+                    'tb_log_dir_path': getattr(self, 'tb_log_dir_path', 'unknown')
+                }
+                json.dump(json_content, fp, indent=0)
                 fp.write('\n')
         
         log_dict = {}

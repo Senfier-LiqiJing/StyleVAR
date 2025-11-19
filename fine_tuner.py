@@ -65,6 +65,10 @@ class StyleVARTrainer(object):
             style_B3HW = style_B3HW.to(dist.get_device(), non_blocking=True)
             content_B3HW = content_B3HW.to(dist.get_device(), non_blocking=True)
             
+            inp_B3HW = inp_B3HW.float()
+            style_B3HW = style_B3HW.float()
+            content_B3HW = content_B3HW.float()
+
             gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
             x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
@@ -106,6 +110,9 @@ class StyleVARTrainer(object):
         if prog_si == len(self.patch_nums) - 1: prog_si = -1    # max prog, as if no prog
         
         # forward
+        inp_B3HW = inp_B3HW.float()
+        style_B3HW = style_B3HW.float()
+        content_B3HW = content_B3HW.float()
         B = inp_B3HW.shape[0]
         V = self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
@@ -145,7 +152,11 @@ class StyleVARTrainer(object):
             else:               # not in progressive training
                 Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)).item()
                 acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
-            grad_norm = grad_norm.item()
+            if grad_norm is not None:
+                grad_norm = grad_norm.item()
+            else:
+                grad_norm = 0.0
+            # grad_norm = grad_norm.item()
             metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm)
         
         # log to tensorboard

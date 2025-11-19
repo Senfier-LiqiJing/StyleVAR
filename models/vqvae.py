@@ -8,9 +8,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+import os
+import sys
 
-from basic_vae import Decoder, Encoder
-from quant import VectorQuantizer2
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+
+from .basic_vae import Decoder, Encoder
+from .quant import VectorQuantizer2
 
 
 class VQVAE(nn.Module):

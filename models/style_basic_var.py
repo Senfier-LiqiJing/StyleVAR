@@ -103,7 +103,7 @@ class CrossAttention(nn.Module):
         #qkv:BL3Hc
         main_type = qkv_guide.dtype
 
-        using_flash = self.using_flash and attn_bias is None and q.dtype != torch.float32
+        using_flash = self.using_flash and attn_bias is None and qkv_guide.dtype != torch.float32
         if using_flash or self.using_xform:
             q, _, _ = qkv_guide.unbind(dim=2)                 # q: BLHc
             _, k, v = qkv_target.unbind(dim=2)                # k and v: BLHc
@@ -172,7 +172,7 @@ class AdaLNCrossAttn(nn.Module):
         self.fused_add_norm_fn = None
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
-    def forward(self, x, style, content, cond_BD, attn_bias, alpha:float =0.5):   # C: embed_dim, D: cond_dim
+    def forward(self, x, style, content, cond_BD, attn_bias, alpha):   # C: embed_dim, D: cond_dim
         if self.shared_aln:
             gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
         else:

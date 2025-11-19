@@ -5,6 +5,7 @@ import sys
 import time
 import warnings
 from functools import partial
+from collections import OrderedDict
 
 import torch
 from torch.utils.data import DataLoader
@@ -37,15 +38,15 @@ def build_everything(args: arg_util.Args):
         # noinspection PyTypeChecker
         tb_lg = misc.DistLogger(None, verbose=False)
     dist.barrier()
-    
+   
     # log args
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
-    
+   
     # build data
     if not args.local_debug:
         print(f'[build PT data] ...\n')
-        # NOTE: This assumes your build_dataset function is modified 
+        # NOTE: This assumes your build_dataset function is modified
         # to return a dataset that yields (target, style, content) tuples.
         # The original return `num_classes` is no longer used for the model.
         _, dataset_train, dataset_val = build_dataset(
@@ -78,19 +79,19 @@ def build_everything(args: arg_util.Args):
         # noinspection PyArgumentList
         print(f'         [dataloader multi processing](*) finished! ({time.time()-stt:.2f}s)', flush=True, clean=True)
         print(f'[dataloader] gbs={args.glb_batch_size}, lbs={args.batch_size}, iters_train={iters_train}, types(tr, va)={types}')
-    
+   
     else:
         # num_classes = 1000 # No longer needed for StyleVAR
         ld_val = ld_train = None
         iters_train = 10
-    
+   
     # build models
     from torch.nn.parallel import DistributedDataParallel as DDP
     # from models import StyleVAR, VQVAE, build_vae_stylevar # Already imported at top
     # from fine_tuner import StyleVARTrainer # Already imported at top
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params
-    
+   
     vae_local, var_wo_ddp = build_vae_stylevar(
         V=4096, Cvae=32, ch=160, share_quant_resi=4,       # hard-coded VQVAE hyperparameters
         device=dist.get_device(), patch_nums=args.patch_nums,
@@ -99,9 +100,9 @@ def build_everything(args: arg_util.Args):
         flash_if_available=args.fuse, fused_if_available=args.fuse,
         init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
         # Add any new args for StyleVAR here, e.g., style_enc_dim
-        style_enc_dim=512 
+        style_enc_dim=512
     )
-    
+   
     # modify to your own path
     vae_ckpt = '/home/PML-Project/checkpoints/vae_ch160v4096z32.pth'
     if dist.is_local_master():
@@ -109,78 +110,114 @@ def build_everything(args: arg_util.Args):
             os.system(f'wget https://huggingface.co/FoundationVision/var/resolve/main/{vae_ckpt}')
     dist.barrier()
     vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-    
+   
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     # --- MODIFIED TYPE HINT ---
     var_wo_ddp: StyleVAR = args.compile_model(var_wo_ddp, args.tfast)
 
-    # ---  Load the original VAR checkpoint ---
-    from collections import OrderedDict
-    
-    var_checkpoint_path = "/home/PML-Project/checkpoints/var_d20.pth"
-    print(f"Loading weights from {var_checkpoint_path}...")
-    
-    try:
-        var_state_dict = torch.load(var_checkpoint_path, map_location='cpu')
-    except Exception as e:
-        print(f"Failed to load checkpoint directly: {e}")
-        print("This might be a full trainer checkpoint. Trying to find the model weights...")
+    is_resuming = (trainer_state is not None) and (len(trainer_state) > 0)
+
+    if is_resuming:
+        if dist.is_local_master():
+            print(f"[Config] 🚀 Detect resume checkpoint (Epoch {start_ep}). SKIPPING original VAR weight loading.")
+
+    else:
+        # --- Not Resuming: Initialize Weights ---
+        clean_ckpt_path = args.clean_ckpt_path
+        vanilla_ckpt_path = args.vanilla_ckpt_path
         
-        full_ckpt = torch.load(var_checkpoint_path, map_location='cpu')
-        if 'trainer' in full_ckpt and 'var_wo_ddp' in full_ckpt['trainer']:
-            var_state_dict = full_ckpt['trainer']['var_wo_ddp']
-            print("Found model weights inside 'trainer.var_wo_ddp'.")
-        elif 'model' in full_ckpt:
-            var_state_dict = full_ckpt['model']
+        # 1. Try to load the Clean Checkpoint (Exact Match)
+        if os.path.exists(clean_ckpt_path):
+            if dist.is_local_master():
+                print(f"[Config] Found CLEAN fine-tuned checkpoint: {clean_ckpt_path}")
+                print("[Config] Loading this as initialization (Fresh Start)...")
+            
+            try:
+                # Load directly as the structure should match
+                state_dict = torch.load(clean_ckpt_path, map_location='cpu')
+                
+                # Handle potential 'model' or 'trainer' wrappers in the saved file
+                if 'model' in state_dict:
+                    state_dict = state_dict['model']
+                elif 'trainer' in state_dict and 'var_wo_ddp' in state_dict['trainer']:
+                    state_dict = state_dict['trainer']['var_wo_ddp']
+
+                missing_keys, unexpected_keys = var_wo_ddp.load_state_dict(state_dict, strict=False)
+                
+                if dist.is_local_master():
+                    print(f"Loaded clean checkpoint. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+                    
+            except Exception as e:
+                print(f"Error loading clean checkpoint: {e}")
+                raise e
+
+        # 2. Fallback to Vanilla VAR Checkpoint (Complex Weight Transfer)
         else:
-            raise ValueError("Could not find model state_dict in checkpoint. Please adjust keys.")
+            if dist.is_local_master():
+                print(f"[Config] No clean checkpoint found. Loading ORIGINAL VAR: {vanilla_ckpt_path}")
+            
+            try:
+                full_ckpt = torch.load(vanilla_ckpt_path, map_location='cpu')
+            except Exception as e:
+                raise FileNotFoundError(f"Failed to load vanilla checkpoint: {e}")
 
-    new_state_dict = OrderedDict()
-    style_model_keys = var_wo_ddp.state_dict().keys() # Use var_wo_ddp here
-    
-    print("Starting weight transfer...")
-    
-    for k, v in var_state_dict.items():
-        if 'attn.mat_qkv.weight' in k:
-            guide_key = k.replace('attn.mat_qkv.weight', 'attn.mat_qkv_guide.weight')
-            target_key = k.replace('attn.mat_qkv.weight', 'attn.mat_qkv_target.weight')
-            if guide_key in style_model_keys: new_state_dict[guide_key] = v
-            if target_key in style_model_keys: new_state_dict[target_key] = v
-        elif 'attn.q_bias' in k:
-            guide_key = k.replace('attn.q_bias', 'attn.q_bias_guide')
-            target_key = k.replace('attn.q_bias', 'attn.q_bias_target')
-            if guide_key in style_model_keys: new_state_dict[guide_key] = v
-            if target_key in style_model_keys: new_state_dict[target_key] = v
-        elif 'attn.v_bias' in k:
-            guide_key = k.replace('attn.v_bias', 'attn.v_bias_guide')
-            target_key = k.replace('attn.v_bias', 'attn.v_bias_target')
-            if guide_key in style_model_keys: new_state_dict[guide_key] = v
-            if target_key in style_model_keys: new_state_dict[target_key] = v
-        elif k in style_model_keys:
-            new_state_dict[k] = v
-        else:
-            print(f"SKIPPED: {k} (not in StyleVAR, e.g., 'class_emb')")
+            # Extract weights from vanilla checkpoint
+            if 'trainer' in full_ckpt and 'var_wo_ddp' in full_ckpt['trainer']:
+                var_state_dict = full_ckpt['trainer']['var_wo_ddp']
+                if dist.is_local_master(): print("Found model weights inside 'trainer.var_wo_ddp'.")
+            elif 'model' in full_ckpt:
+                var_state_dict = full_ckpt['model']
+            else:
+                # Assume the checkpoint itself is the state_dict
+                var_state_dict = full_ckpt
 
-    # --- Load the new state_dict ---
-    missing_keys, unexpected_keys = var_wo_ddp.load_state_dict(new_state_dict, strict=False)
+            # Perform Weight Transfer
+            if dist.is_local_master(): print("Starting weight transfer logic...")
+            
+            new_state_dict = OrderedDict()
+            style_model_keys = var_wo_ddp.state_dict().keys()
 
-    print("\n--- Weight Loading Summary ---")
-    print(f"Successfully loaded {len(new_state_dict)} tensors.")
-    print("\nMissing keys (These are EXPECTED and will be fine-tuned):")
-    for key in sorted(missing_keys): print(f"  {key}")
-    print("\nUnexpected keys (This list should be EMPTY):")
-    for key in sorted(unexpected_keys): print(f"  {key}")
-    print("\nModel loading complete. Ready to fine-tune.")
+            for k, v in var_state_dict.items():
+                # Map Attention Weights (QKV -> Guide/Target)
+                if 'attn.mat_qkv.weight' in k:
+                    guide_key = k.replace('attn.mat_qkv.weight', 'attn.mat_qkv_guide.weight')
+                    target_key = k.replace('attn.mat_qkv.weight', 'attn.mat_qkv_target.weight')
+                    if guide_key in style_model_keys: new_state_dict[guide_key] = v
+                    if target_key in style_model_keys: new_state_dict[target_key] = v
+                
+                # Map Biases
+                elif 'attn.q_bias' in k:
+                    guide_key = k.replace('attn.q_bias', 'attn.q_bias_guide')
+                    target_key = k.replace('attn.q_bias', 'attn.q_bias_target')
+                    if guide_key in style_model_keys: new_state_dict[guide_key] = v
+                    if target_key in style_model_keys: new_state_dict[target_key] = v
+                elif 'attn.v_bias' in k:
+                    guide_key = k.replace('attn.v_bias', 'attn.v_bias_guide')
+                    target_key = k.replace('attn.v_bias', 'attn.v_bias_target')
+                    if guide_key in style_model_keys: new_state_dict[guide_key] = v
+                    if target_key in style_model_keys: new_state_dict[target_key] = v
+                
+                # Direct Copy for matching keys
+                elif k in style_model_keys:
+                    new_state_dict[k] = v
+                else:
+                    # Key exists in Vanilla but not in StyleVAR (e.g. unused class embeddings)
+                    pass
 
-    # --- END MODIFIED TYPE HINT ---
+            # Load the mapped weights
+            missing_keys, unexpected_keys = var_wo_ddp.load_state_dict(new_state_dict, strict=False)
+
+            if dist.is_local_master():
+                print("\n--- Weight Loading Summary (Vanilla Transfer) ---")
+                print(f"Successfully loaded {len(new_state_dict)} tensors.")
+                print("\nMissing keys (Expected and will be fine-tuned):")
+                for key in sorted(missing_keys): print(f"  {key}")
+                print("\nUnexpected keys (Should be empty):")
+                for key in sorted(unexpected_keys): print(f"  {key}")
+                print("\nModel loading complete.")
+
     var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
-    
     print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
-    count_p = lambda m: f'{sum(p.numel() for p in m.parameters())/1e6:.2f}'
-    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder), ('VAE.quant', vae_local.quantize))]))
-    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_wo_ddp),)]) + '\n\n')
-    
-    # build optimizer
     names, paras, para_groups = filter_params(var_wo_ddp, nowd_keys={
         'cls_token', 'start_token', 'task_token', 'cfg_uncond',
         'pos_embed', 'pos_1LC', 'pos_start', 'start_pos', 'lvl_embed',
@@ -194,13 +231,12 @@ def build_everything(args: arg_util.Args):
     }[args.opt.lower().strip()]
     opt_kw = dict(lr=args.tlr, weight_decay=0)
     print(f'[INIT] optim={opt_clz}, opt_kw={opt_kw}\n')
-    
     var_optim = AmpOptimizer(
         mixed_precision=args.fp16, optimizer=opt_clz(params=para_groups, **opt_kw), names=names, paras=paras,
         grad_clip=args.tclip, n_gradient_accumulation=args.ac
     )
     del names, paras, para_groups
-    
+
     # build trainer
     trainer = StyleVARTrainer(
         device=args.device, patch_nums=args.patch_nums, resos=args.resos,
@@ -210,7 +246,7 @@ def build_everything(args: arg_util.Args):
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
     del vae_local, var_wo_ddp, var, var_optim
-    
+   
     # --- MODIFIED DEBUG BLOCK ---
     if args.local_debug:
         rng = torch.Generator('cpu')
@@ -225,13 +261,13 @@ def build_everything(args: arg_util.Args):
         # Call train_step with the new signature
         trainer.train_step(
             it=0, g_it=0, stepping=True, metric_lg=me, tb_lg=tb_lg,
-            inp_B3HW=inp, style_B3HW=style, content_B3HW=content, 
+            inp_B3HW=inp, style_B3HW=style, content_B3HW=content,
             prog_si=args.pg0, prog_wp_it=20,
         )
         trainer.load_state_dict(trainer.state_dict())
         trainer.train_step(
             it=99, g_it=599, stepping=True, metric_lg=me, tb_lg=tb_lg,
-            inp_B3HW=inp, style_B3HW=style, content_B3HW=content, 
+            inp_B3HW=inp, style_B3HW=style, content_B3HW=content,
             prog_si=-1, prog_wp_it=20,
         )
         print({k: meter.global_avg for k, meter in me.meters.items()})
@@ -241,13 +277,12 @@ def build_everything(args: arg_util.Args):
             sys.stdout.close(), sys.stderr.close()
         exit(0)
     # --- END MODIFIED DEBUG BLOCK ---
-    
+   
     dist.barrier()
     return (
         tb_lg, trainer, start_ep, start_it,
         iters_train, ld_train, ld_val
     )
-
 
 def main_training():
     args: arg_util.Args = arg_util.init_dist_and_get_args()
@@ -259,6 +294,7 @@ def main_training():
         start_ep, start_it,
         iters_train, ld_train, ld_val
     ) = build_everything(args)
+    print("[INIT] Build Everything Ready.")
     
     # train
     start_time = time.time()
@@ -273,11 +309,9 @@ def main_training():
                 # noinspection PyArgumentList
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
-        
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
         )
-        
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
         if L_tail != -1: best_L_tail, best_acc_tail = min(best_L_tail, L_tail), max(best_acc_tail, acc_tail)
@@ -286,7 +320,7 @@ def main_training():
         args.remain_time, args.finish_time = remain_time, finish_time
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
-        is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
+        is_val_and_also_saving = (ep + 1) % 1 == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
