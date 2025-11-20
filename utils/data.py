@@ -75,6 +75,15 @@ class StyleTransferDataset(Dataset):
             # For now, just recursively get the next one to avoid crashing training
             return self.__getitem__((idx + 1) % len(self))
 
+class SubsetWrapper(Dataset):
+    def __init__(self, subset, transform):
+        self.subset = subset
+        self.transform = transform
+    def __len__(self): return len(self.subset)
+    def __getitem__(self, idx):
+        t, s, c = self.subset[idx] # These are PIL images because transform=None above
+        return self.transform(t), self.transform(s), self.transform(c)
+
 def build_dataset(
     data_path: str, final_reso: int,
     hflip=False, mid_reso=1.125,
@@ -83,24 +92,33 @@ def build_dataset(
     mid_reso = round(mid_reso * final_reso)  # first resize to mid_reso, then crop to final_reso
     
     # Common transform for training
-    train_aug = transforms.Compose([
-        transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS), 
-        transforms.RandomCrop((final_reso, final_reso)),
+    common_transform = transforms.Compose([
+        transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
         transforms.ToTensor(), 
         normalize_01_into_pm1,
     ])
+    #train_aug = transforms.Compose([
+    #    transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS), 
+    #    transforms.RandomCrop((final_reso, final_reso)),
+    #    transforms.ToTensor(), 
+    #    normalize_01_into_pm1,
+    #])
     
     if hflip:
-        train_aug.transforms.insert(0, transforms.RandomHorizontalFlip())
+        print("Warning: hflip is disabled to ensure Content-Target alignment during fine-tuning.")
+        #train_aug.transforms.insert(0, transforms.RandomHorizontalFlip())
 
     # Common transform for validation (CenterCrop)
-    val_aug = transforms.Compose([
-        transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS), 
-        transforms.CenterCrop((final_reso, final_reso)),
-        transforms.ToTensor(), 
-        normalize_01_into_pm1,
-    ])
+    #val_aug = transforms.Compose([
+    #    transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS), 
+    #    transforms.CenterCrop((final_reso, final_reso)),
+    #    transforms.ToTensor(), 
+    #    normalize_01_into_pm1,
+    #])
     
+    train_aug = common_transform
+    val_aug = common_transform
+
     # Assume structure: /home/OmniStyle-150K/
     # We split the list of files manually for train/val since they are in the same folder structure
     full_dataset = StyleTransferDataset(root_dir=data_path, transform=None)
@@ -117,15 +135,6 @@ def build_dataset(
     # Note: Dataset subsets don't easily support different transforms per subset. 
     # We wrap them in a helper class or just use train_aug for both if acceptable, 
     # BUT best practice is a wrapper.
-    
-    class SubsetWrapper(Dataset):
-        def __init__(self, subset, transform):
-            self.subset = subset
-            self.transform = transform
-        def __len__(self): return len(self.subset)
-        def __getitem__(self, idx):
-            t, s, c = self.subset[idx] # These are PIL images because transform=None above
-            return self.transform(t), self.transform(s), self.transform(c)
 
     train_set = SubsetWrapper(train_subset, train_aug)
     val_set = SubsetWrapper(val_subset, val_aug)

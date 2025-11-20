@@ -42,23 +42,24 @@ class Args(Tap):
     alng: float = 1e-5  # the multiplier of ada_lin.w[gamma channels]'s initialization
     # VAR optimization
     fp16: int = 0           # 1: using fp16, 2: bf16
-    tblr: float = 1e-4      # base lr
+    tblr: float = 5e-4      # base lr
     tlr: float = None       # lr = base lr * (bs / 256)
     twd: float = 0.05       # initial wd
     twde: float = 0         # final wd, =twde or twd
     tclip: float = 2.       # <=0 for not using grad clip
     ls: float = 0.0         # label smooth
     
-    bs: int = 128           # global batch size
+    bs: int = 1024           # global batch size
     batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size() / 8) * 8
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
-    ac: int = 16             # gradient accumulation
+    ac: int = 128             # gradient accumulation
     
-    ep: int = 2
+    ep: int = 11
     wp: float = 0
     wp0: float = 0.005      # initial lr ratio at the begging of lr warm up
     wpe: float = 0.01       # final lr ratio at the end of training
-    sche: str = 'lin0'      # lr schedule
+    #sche: str = 'lin0'      # lr schedule
+    sche: str = 'lin1'      # lr schedule
     
     opt: str = 'adamw'      # lion: https://cloud.tencent.com/developer/article/2336657?areaId=106001 lr=5e-5 (0.25x) wd=0.8 (8x); Lion needs a large bs to work
     afuse: bool = True      # fused adamw
@@ -77,7 +78,7 @@ class Args(Tap):
     data_load_reso: int = None  # [automatically set; don't specify this] would be max(patch_nums) * patch_size
     mid_reso: float = 1.125     # aug: first resize to mid_reso = 1.125 * data_load_reso, then crop to data_load_reso
     hflip: bool = False         # augmentation: horizontal flip
-    workers: int = 0        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
+    workers: int = 6        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
     
     # progressive training
     pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
