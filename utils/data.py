@@ -14,66 +14,96 @@ def pil_loader(path):
     return img
 
 class StyleTransferDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        """
-        root_dir: /home/OmniStyle-150K/
-        transform: torchvision transforms
-        """
+    """
+    Dataset that reads <target> images and pairs them with their corresponding
+    content and style images. Target filenames are expected to follow:
+        {content_filename}&&{style_filename}.png
+    where {style_filename} already contains its original extension (e.g. ".jpg.jpg").
+    """
+    def __init__(self, root_dir, transform=None, max_resample=10):
         self.root_dir = root_dir
         self.target_dir = osp.join(root_dir, 'target')
         self.style_dir = osp.join(root_dir, 'style')
         self.content_dir = osp.join(root_dir, 'content')
         self.transform = transform
-        
-        # 1. Scan all target files
-        # Filename format: "content_name.png&&style_name.jpg"
-        self.target_files = [f for f in os.listdir(self.target_dir) if '&&' in f]
-        
-        print(f"[Dataset] Found {len(self.target_files)} target images.")
-        
+        self.max_resample = max(1, int(max_resample))
+
+        self.content_lookup = self._build_lookup(self.content_dir)
+        self.style_lookup = self._build_lookup(self.style_dir)
+        self.samples = self._build_samples()
+
+        if len(self.samples) == 0:
+            raise RuntimeError(f'No valid triplets found under {root_dir}')
+
+        print(f"[Dataset] Found {len(self.samples)} valid target/style/content triplets "
+              f"(missing content: {self.missing_content}, missing style: {self.missing_style}).")
+
+    @staticmethod
+    def _build_lookup(directory):
+        return {
+            fname: osp.join(directory, fname)
+            for fname in os.listdir(directory)
+            if osp.isfile(osp.join(directory, fname))
+        }
+
+    def _build_samples(self):
+        samples = []
+        self.missing_content = 0
+        self.missing_style = 0
+        target_files = [
+            f for f in os.listdir(self.target_dir)
+            if '&&' in f and osp.isfile(osp.join(self.target_dir, f))
+        ]
+        target_files.sort()
+
+        for target_file in target_files:
+            content_name, style_token = target_file.split('&&', 1)
+            style_name = style_token[:-4] if style_token.lower().endswith('.png') else style_token
+
+            content_path = self.content_lookup.get(content_name)
+            if content_path is None:
+                self.missing_content += 1
+                continue
+
+            style_path = self.style_lookup.get(style_name)
+            if style_path is None:
+                self.missing_style += 1
+                continue
+
+            target_path = osp.join(self.target_dir, target_file)
+            samples.append((target_path, style_path, content_path))
+
+        return samples
+
     def __len__(self):
-        return len(self.target_files)
-    
+        return len(self.samples)
+
     def __getitem__(self, idx):
-        target_filename = self.target_files[idx]
-        
-        # 2. Parse filenames
-        # Format: content_part&&style_part
-        try:
-            content_name_raw, style_name_raw = target_filename.split('&&')
-            
-            # Content image always ends with .png (from prompt req 3)
-            # The target filename seems to keep the content extension, e.g., "name.png"
-            content_path = osp.join(self.content_dir, content_name_raw)
-            
-            # Style image logic (from prompt req 3):
-            # "the first might be jpg,jpeg or wpeg... but the last suffix must be .jpg"
-            # The target filename usually has the full style name including original extensions.
-            # We assume style_name_raw matches the file in style_dir directly, 
-            # OR we need to ensure it ends with .jpg if the split stripped it.
-            style_name_raw = style_name_raw[:-4]
-            style_path = osp.join(self.style_dir, style_name_raw)
-            
-            target_path = osp.join(self.target_dir, target_filename)
-            
-            # 3. Load Images
-            content_img = pil_loader(content_path)
-            style_img = pil_loader(style_path)
-            target_img = pil_loader(target_path)
-            
-            # 4. Apply Transforms
-            if self.transform:
-                content_img = self.transform(content_img)
-                style_img = self.transform(style_img)
-                target_img = self.transform(target_img)
-                
-            return target_img, style_img, content_img
-            
-        except Exception as e:
-            print(f"[Dataset Error] Failed to load idx {idx}: {target_filename}. Error: {e}")
-            # Return a dummy valid sample (or handle error appropriately)
-            # For now, just recursively get the next one to avoid crashing training
-            return self.__getitem__((idx + 1) % len(self))
+        trials = 0
+        cur_idx = idx % len(self.samples)
+        last_error = None
+
+        while trials < self.max_resample:
+            target_path, style_path, content_path = self.samples[cur_idx]
+            try:
+                target_img = pil_loader(target_path)
+                style_img = pil_loader(style_path)
+                content_img = pil_loader(content_path)
+
+                if self.transform:
+                    target_img = self.transform(target_img)
+                    style_img = self.transform(style_img)
+                    content_img = self.transform(content_img)
+
+                return target_img, style_img, content_img
+            except Exception as exc:  # corrupted triplet
+                last_error = exc
+                print(f"[Dataset Warning] Skip corrupt triplet idx={cur_idx}: {exc}")
+                trials += 1
+                cur_idx = (cur_idx + 1) % len(self.samples)
+
+        raise RuntimeError(f"Failed to fetch a valid triplet after {self.max_resample} attempts "
+                           f"(last error: {last_error})")
 
 class SubsetWrapper(Dataset):
     def __init__(self, subset, transform):
@@ -88,58 +118,50 @@ def build_dataset(
     data_path: str, final_reso: int,
     hflip=False, mid_reso=1.125,
 ):
-    # build augmentations (Same as vanilla VAR)
-    mid_reso = round(mid_reso * final_reso)  # first resize to mid_reso, then crop to final_reso
-    
-    # Common transform for training
-    common_transform = transforms.Compose([
-        transforms.Resize((final_reso, final_reso), interpolation=InterpolationMode.LANCZOS),
-        transforms.ToTensor(), 
+    # build augmentations similar to the vanilla VAR recipe
+    mid_reso = round(mid_reso * final_reso)
+    train_aug = [
+        transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
+        transforms.RandomCrop((final_reso, final_reso)),
+        transforms.ToTensor(),
         normalize_01_into_pm1,
-    ])
-    #train_aug = transforms.Compose([
-    #    transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS), 
-    #    transforms.RandomCrop((final_reso, final_reso)),
-    #    transforms.ToTensor(), 
-    #    normalize_01_into_pm1,
-    #])
-    
+    ]
     if hflip:
-        print("Warning: hflip is disabled to ensure Content-Target alignment during fine-tuning.")
-        #train_aug.transforms.insert(0, transforms.RandomHorizontalFlip())
+        train_aug.insert(0, transforms.RandomHorizontalFlip())
 
-    # Common transform for validation (CenterCrop)
-    #val_aug = transforms.Compose([
-    #    transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS), 
-    #    transforms.CenterCrop((final_reso, final_reso)),
-    #    transforms.ToTensor(), 
-    #    normalize_01_into_pm1,
-    #])
-    
-    train_aug = common_transform
-    val_aug = common_transform
+    val_aug = [
+        transforms.Resize(mid_reso, interpolation=InterpolationMode.LANCZOS),
+        transforms.CenterCrop((final_reso, final_reso)),
+        transforms.ToTensor(),
+        normalize_01_into_pm1,
+    ]
 
-    # Assume structure: /home/OmniStyle-150K/
-    # We split the list of files manually for train/val since they are in the same folder structure
-    full_dataset = StyleTransferDataset(root_dir=data_path, transform=None)
-    
-    # Split dataset: 95% train, 5% val (or whatever logic you prefer)
-    total_len = len(full_dataset)
-    val_len = int(total_len * 0.05)
-    train_len = total_len - val_len
-    
-    from torch.utils.data import random_split
-    train_subset, val_subset = random_split(full_dataset, [train_len, val_len], generator=torch.Generator().manual_seed(42))
-    
-    # Assign specific transforms to subsets
-    # Note: Dataset subsets don't easily support different transforms per subset. 
-    # We wrap them in a helper class or just use train_aug for both if acceptable, 
-    # BUT best practice is a wrapper.
+    train_aug = transforms.Compose(train_aug)
+    val_aug = transforms.Compose(val_aug)
+
+    base_dataset = StyleTransferDataset(root_dir=data_path, transform=None)
+    total_len = len(base_dataset)
+    if total_len == 0:
+        raise RuntimeError(f"No samples were found under {data_path} to build datasets.")
+
+    from torch.utils.data import random_split, Subset
+
+    if total_len == 1:
+        train_subset = Subset(base_dataset, [0])
+        val_subset = Subset(base_dataset, [])
+    else:
+        val_len = max(1, int(total_len * 0.05))
+        val_len = min(val_len, total_len - 1)
+        train_len = total_len - val_len
+        train_subset, val_subset = random_split(
+            base_dataset,
+            [train_len, val_len],
+            generator=torch.Generator().manual_seed(42),
+        )
 
     train_set = SubsetWrapper(train_subset, train_aug)
     val_set = SubsetWrapper(val_subset, val_aug)
-    
-    num_classes = 1000 
-    print(f'[Dataset] Train: {len(train_set)}, Val: {len(val_set)}')
-    
+
+    num_classes = 1000
+    print(f'[Dataset] len(train_set)={len(train_set)}, len(val_set)={len(val_set)}, num_classes={num_classes}')
     return num_classes, train_set, val_set

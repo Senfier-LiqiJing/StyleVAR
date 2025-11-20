@@ -4,7 +4,11 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin
+try:
+    from huggingface_hub import PyTorchModelHubMixin
+except ImportError:  # graceful fallback when huggingface_hub isn't installed
+    class PyTorchModelHubMixin:
+        pass
 import os
 import sys
 
