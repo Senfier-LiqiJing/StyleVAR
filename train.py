@@ -8,6 +8,7 @@ from functools import partial
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import dist
 from utils import arg_util, misc
@@ -77,34 +78,62 @@ def build_everything(args: arg_util.Args):
     
     # build models
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from models import VAR, VQVAE, build_vae_var
-    from trainer import VARTrainer
+    from models import StyleVAR, VQVAE
+    from trainer import StyleVARTrainer
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params
-    
-    vae_local, var_wo_ddp = build_vae_var(
-        V=4096, Cvae=32, ch=160, share_quant_resi=4,        # hard-coded VQVAE hyperparameters
-        device=dist.get_device(), patch_nums=args.patch_nums,
-        num_classes=num_classes, depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
-        flash_if_available=args.fuse, fused_if_available=args.fuse,
-        init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
+
+    vae_local = VQVAE(vocab_size=4096, z_channels=32, ch=160, test_mode=True, share_quant_resi=4, v_patch_nums=args.patch_nums).to(dist.get_device())
+    if args.vae_ckpt_path:
+        vae_state = torch.load(args.vae_ckpt_path, map_location='cpu')
+        vae_local.load_state_dict(vae_state, strict=True)
+    [p.requires_grad_(False) for p in vae_local.parameters()]
+    vae_local.eval()
+
+    heads = args.depth
+    width = args.depth * 64
+    dpr = 0.1 * args.depth / 24
+    var_kwargs = dict(
+        num_classes=num_classes,
+        depth=args.depth,
+        embed_dim=width,
+        num_heads=heads,
+        mlp_ratio=4.0,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=dpr,
+        norm_eps=1e-6,
+        shared_aln=args.saln,
+        cond_drop_rate=0.1,
+        style_enc_dim=args.style_enc_dim,
+        attn_l2_norm=args.anorm,
+        patch_nums=args.patch_nums,
+        flash_if_available=args.fuse,
+        fused_if_available=args.fuse,
+        alpha_nums=args.alpha_nums,
+        lora_rank=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
     )
-    
-    vae_ckpt = 'vae_ch160v4096z32.pth'
-    if dist.is_local_master():
-        if not os.path.exists(vae_ckpt):
-            os.system(f'wget https://huggingface.co/FoundationVision/var/resolve/main/{vae_ckpt}')
-    dist.barrier()
-    vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-    
-    vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
-    var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
+    var_wo_ddp, load_info = StyleVAR.from_pretrained(
+        vae_local=vae_local,
+        pretrained_path=args.vanilla_ckpt_path,
+        map_location='cpu',
+        zero_unmatched=bool(args.zero_unmatched),
+        freeze_resnet=args.freeze_resnet,
+        freeze_backbone=args.freeze_backbone,
+        **var_kwargs,
+    )
+    var_wo_ddp = var_wo_ddp.to(dist.get_device())
+
+    var_wo_ddp: StyleVAR = args.compile_model(var_wo_ddp, args.tfast)
     var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
     
-    print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
+    print(f'[INIT] StyleVAR model = {var_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters())/1e6:.2f}'
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder), ('VAE.quant', vae_local.quantize))]))
-    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_wo_ddp),)]) + '\n\n')
+    print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('StyleVAR', var_wo_ddp),)]) + '\n\n')
+    print(f'[INIT][pretrained] loaded={len(load_info.get("loaded", []))}, zeroed={len(load_info.get("zeroed", []))}')
     
     # build optimizer
     names, paras, para_groups = filter_params(var_wo_ddp, nowd_keys={
@@ -128,7 +157,7 @@ def build_everything(args: arg_util.Args):
     del names, paras, para_groups
     
     # build trainer
-    trainer = VARTrainer(
+    trainer = StyleVARTrainer(
         device=args.device, patch_nums=args.patch_nums, resos=args.resos,
         vae_local=vae_local, var_wo_ddp=var_wo_ddp, var=var,
         var_opt=var_optim, label_smooth=args.ls,
@@ -141,18 +170,19 @@ def build_everything(args: arg_util.Args):
         rng = torch.Generator('cpu')
         rng.manual_seed(0)
         B = 4
-        inp = torch.rand(B, 3, args.data_load_reso, args.data_load_reso)
-        label = torch.ones(B, dtype=torch.long)
+        target = torch.rand(B, 3, args.data_load_reso, args.data_load_reso)
+        style = torch.rand(B, 3, args.data_load_reso, args.data_load_reso)
+        content = torch.rand(B, 3, args.data_load_reso, args.data_load_reso)
         
         me = misc.MetricLogger(delimiter='  ')
         trainer.train_step(
             it=0, g_it=0, stepping=True, metric_lg=me, tb_lg=tb_lg,
-            inp_B3HW=inp, label_B=label, prog_si=args.pg0, prog_wp_it=20,
+            target_B3HW=target, style_B3HW=style, content_B3HW=content, prog_si=args.pg0, prog_wp_it=20,
         )
         trainer.load_state_dict(trainer.state_dict())
         trainer.train_step(
             it=99, g_it=599, stepping=True, metric_lg=me, tb_lg=tb_lg,
-            inp_B3HW=inp, label_B=label, prog_si=-1, prog_wp_it=20,
+            target_B3HW=target, style_B3HW=style, content_B3HW=content, prog_si=-1, prog_wp_it=20,
         )
         print({k: meter.global_avg for k, meter in me.meters.items()})
         
@@ -206,6 +236,8 @@ def main_training():
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
         is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
+        # step-level saving
+        step_save = args.save_every > 0 and (g_it + 1) % args.save_every == 0
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
@@ -227,6 +259,18 @@ def main_training():
                 }, local_out_ckpt)
                 if best_updated:
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
+                print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
+            dist.barrier()
+        elif step_save:
+            if dist.is_local_master():
+                local_out_ckpt = os.path.join(args.local_out_dir_path, f'ar-ckpt-step{g_it+1}.pth')
+                print(f'[saving ckpt @ step {g_it+1}] ...', end='', flush=True)
+                torch.save({
+                    'epoch':    ep,
+                    'iter':     it+1,
+                    'trainer':  trainer.state_dict(),
+                    'args':     args.state_dict(),
+                }, local_out_ckpt)
                 print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
             dist.barrier()
         
@@ -269,13 +313,25 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         warnings.filterwarnings('ignore', category=UserWarning)
     g_it, max_it = ep * iters_train, args.ep * iters_train
     
-    for it, (inp, label) in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
+    pbar = tqdm(
+        range(start_it, iters_train),
+        total=iters_train,
+        initial=start_it,
+        disable=not dist.is_local_master(),
+        dynamic_ncols=True,
+        leave=False,
+        desc=f'{header}',
+    )
+    for it in range(start_it, iters_train):
+        batch = next(ld_or_itrt)
         g_it = ep * iters_train + it
         if it < start_it: continue
         if is_first_ep and it == start_it: warnings.resetwarnings()
         
-        inp = inp.to(args.device, non_blocking=True)
-        label = label.to(args.device, non_blocking=True)
+        target, style, content = batch
+        target = target.to(args.device, non_blocking=True)
+        style = style.to(args.device, non_blocking=True)
+        content = content.to(args.device, non_blocking=True)
         
         args.cur_it = f'{it+1}/{iters_train}'
         
@@ -298,7 +354,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         
         grad_norm, scale_log2 = trainer.train_step(
             it=it, g_it=g_it, stepping=stepping, metric_lg=me, tb_lg=tb_lg,
-            inp_B3HW=inp, label_B=label, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
+            target_B3HW=target, style_B3HW=style, content_B3HW=content, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
         )
         
         me.update(tlr=max_tlr)
@@ -313,6 +369,15 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
             tb_lg.update(head='AR_opt_grad/grad', grad_norm=grad_norm)
             tb_lg.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
     
+        if dist.is_local_master():
+            pbar.set_postfix({
+                'Lm': f"{me.meters['Lm'].median:.3f}" if 'Lm' in me.meters else '-',
+                'Acc': f"{me.meters['Accm'].median:.2f}" if 'Accm' in me.meters else '-',
+                'tlr': f"{max_tlr:.2g}",
+            })
+            pbar.update(1)
+    if dist.is_local_master():
+        pbar.close()
     me.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in me.meters.items()}, me.iter_time.time_preds(max_it - (g_it + 1) + (args.ep - ep) * 15)  # +15: other cost
 

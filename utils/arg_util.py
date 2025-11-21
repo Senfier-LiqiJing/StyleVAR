@@ -21,14 +21,17 @@ except ImportError as e:
 
 import dist
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+
 
 class Args(Tap):
     #data_path: str = '/path/to/imagenet'
     #data_path: str = '/home/OmniStyle-150k-tensor'
-    data_path: str = '/home/OmniStyle-150K'
+    data_path: str = os.path.join(PROJECT_ROOT, 'dataset')
     exp_name: str = 'style_var'
-    clean_ckpt_path: str = '/home/PML-Project/local_output/style_var_d20_clean_fp32.pth' # this path does not contain vqvae or trainer state
-    vanilla_ckpt_path:str = "/home/PML-Project/checkpoints/var_d20.pth"
+    vae_ckpt_path: str = os.path.join(PROJECT_ROOT, 'origin_checkpoints', 'vae_ch160v4096z32.pth')
+    clean_ckpt_path: str = os.path.join(PROJECT_ROOT, 'local_output', 'style_var_d20_clean_fp32.pth') # this path does not contain vqvae or trainer state
+    vanilla_ckpt_path:str = os.path.join(PROJECT_ROOT, 'origin_checkpoints', 'var_d20.pth')
     
     # VAE
     vfast: int = 0      # torch.compile VAE; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'
@@ -49,10 +52,23 @@ class Args(Tap):
     tclip: float = 2.       # <=0 for not using grad clip
     ls: float = 0.0         # label smooth
     
-    bs: int = 1024           # global batch size
+    bs: int = 4           # global batch size
     batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size() / 8) * 8
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
-    ac: int = 128             # gradient accumulation
+    ac: int = 2             # gradient accumulation
+
+    # LoRA/backbone controls
+    lora_r: int = 4
+    lora_alpha: float = 8.0
+    lora_dropout: float = 0.05
+    freeze_backbone: int = 1     # freeze copied VAR weights
+    freeze_resnet: int = 1       # freeze style/content encoders
+    zero_unmatched: int = 1      # zero init params not copied from VAR
+    style_enc_dim: int = 512
+    alpha_nums: tuple = (0.2,0.3,0.4,0.4,0.5,0.5,0.6,0.6,0.7,0.8)
+
+    # checkpoint/save frequency
+    save_every: int = 0   # 0 表示按默认逻辑（每10个epoch及最后一次）；>0 表示每隔多少iter保存一次本地ckpt
     
     ep: int = 11
     wp: float = 0
@@ -78,7 +94,7 @@ class Args(Tap):
     data_load_reso: int = None  # [automatically set; don't specify this] would be max(patch_nums) * patch_size
     mid_reso: float = 1.125     # aug: first resize to mid_reso = 1.125 * data_load_reso, then crop to data_load_reso
     hflip: bool = False         # augmentation: horizontal flip
-    workers: int = 6        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
+    workers: int = 0        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
     
     # progressive training
     pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
@@ -234,6 +250,17 @@ def init_dist_and_get_args():
     else:
         if args.data_path == '/path/to/imagenet':
             raise ValueError(f'{"*"*40}  please specify --data_path=/path/to/imagenet  {"*"*40}')
+    
+    # normalize alpha / boolean-like flags
+    if isinstance(args.alpha_nums, str):
+        try:
+            args.alpha_nums = tuple(float(x) for x in args.alpha_nums.replace(',', ' ').split())
+        except Exception:
+            args.alpha_nums = (0.2,0.3,0.4,0.4,0.5,0.5,0.6,0.6,0.7,0.8)
+    args.freeze_backbone = bool(args.freeze_backbone)
+    args.freeze_resnet = bool(args.freeze_resnet)
+    args.zero_unmatched = bool(args.zero_unmatched)
+    args.save_every = int(args.save_every or 0)
     
     # warn args.extra_args
     if len(args.extra_args) > 0:

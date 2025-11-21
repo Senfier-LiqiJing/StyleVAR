@@ -9,7 +9,7 @@ if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
 from .quant import VectorQuantizer2
-#from .var import VAR
+from .var import VAR
 from .style_var import StyleVAR
 from .vqvae import VQVAE
 
@@ -23,7 +23,8 @@ def build_vae_stylevar(
     num_classes=1000, depth=20, shared_aln=False, attn_l2_norm=True, style_enc_dim = 512,
     flash_if_available=True, fused_if_available=True,
     init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=-1,    # init_std < 0: automated
-    alpha_nums = (0.2,0.3,0.4,0.4,0.5,0.5,0.6,0.6,0.7,0.8) # 10 alpha numbers
+    alpha_nums = (0.2,0.3,0.4,0.4,0.5,0.5,0.6,0.6,0.7,0.8), # 10 alpha numbers
+    lora_rank: int = 0, lora_alpha: float = 1.0, lora_dropout: float = 0.0,
 ) -> Tuple[VQVAE, StyleVAR]:
     heads = depth
     width = depth * 64
@@ -42,7 +43,8 @@ def build_vae_stylevar(
         attn_l2_norm=attn_l2_norm,
         patch_nums=patch_nums,
         flash_if_available=flash_if_available, fused_if_available=fused_if_available,
-        alpha_nums=alpha_nums
+        alpha_nums=alpha_nums,
+        lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
     ).to(device)
     var_wo_ddp.init_weights(init_adaln=init_adaln, init_adaln_gamma=init_adaln_gamma, init_head=init_head, init_std=init_std)
     
