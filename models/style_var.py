@@ -77,7 +77,11 @@ class StyleVAR(nn.Module):
         }
         self.style_encoder = nn.Sequential(*list(models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1).children())[:-1])
         self.content_encoder = nn.Sequential(*list(models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1).children())[:-1])
-        self.feat_emb = make_lora_linear(self.style_enc_dim, self.C, bias=True, lora_cfg=self.lora_cfg)
+        self.feat_emb = nn.Linear(self.style_enc_dim, self.C, bias=True)
+        with torch.no_grad():
+            self.feat_emb.weight.zero_()
+            if self.feat_emb.bias is not None:
+                self.feat_emb.bias.zero_()
 
         # 1. input (word) embedding
         quant: VectorQuantizer2 = vae_local.quantize
@@ -409,14 +413,24 @@ class StyleVAR(nn.Module):
 
         loaded_keys, zeroed_keys = set(), []
 
+        loaded_pairs = []
+
         def try_copy(src_key: str, dst_key: str):
             nonlocal loaded_keys
-            if dst_key not in target_state:
+            candidates = [dst_key]
+            if dst_key.endswith('.weight'):
+                candidates.append(dst_key.replace('.weight', '.base_layer.weight'))
+            if dst_key.endswith('.bias'):
+                candidates.append(dst_key.replace('.bias', '.base_layer.bias'))
+            for cand in candidates:
+                if cand not in target_state:
+                    continue
+                if target_state[cand].shape != normalized[src_key].shape:
+                    continue
+                target_state[cand] = normalized[src_key]
+                loaded_keys.add(cand)
+                loaded_pairs.append((src_key, cand, tuple(target_state[cand].shape)))
                 return
-            if target_state[dst_key].shape != normalized[src_key].shape:
-                return
-            target_state[dst_key] = normalized[src_key]
-            loaded_keys.add(dst_key)
 
         for k in normalized.keys():
             if not k.startswith('blocks.') or '.attn.' not in k:
@@ -443,41 +457,99 @@ class StyleVAR(nn.Module):
                 continue
             try_copy(k, k)
 
-        # zero-init unmatched trainable params (skip resnet encoders and LoRA adapters)
+        self.load_state_dict(target_state, strict=False)
+
         if zero_unmatched:
             for name, param in self.named_parameters():
                 if name in loaded_keys:
                     continue
                 if name.startswith('style_encoder') or name.startswith('content_encoder'):
                     continue
-                if 'lora_' in name:
+                if name.startswith('vae_proxy') or name.startswith('vae_quant_proxy'):
                     continue
                 with torch.no_grad():
                     param.zero_()
                     zeroed_keys.append(name)
 
-        self.load_state_dict(target_state, strict=False)
         self._loaded_param_names = loaded_keys
-        return loaded_keys, zeroed_keys
+        self._loaded_param_pairs = loaded_pairs
+        self._zero_initialized_param_names = set(zeroed_keys)
+        return loaded_keys, zeroed_keys, loaded_pairs
 
-    def freeze_loaded_parameters(self, freeze_resnet: bool = True, freeze_all_backbone: bool = True):
+    def apply_training_policy(self, freeze_backbone: bool = True):
         loaded = getattr(self, '_loaded_param_names', set())
+        zeroed = set(getattr(self, '_zero_initialized_param_names', set()))
+
+        frozen_names, frozen_loaded_base = [], []
+        zero_trainable, lora_trainable, other_trainable = [], [], []
+
         for name, param in self.named_parameters():
-            # LoRA adapters continue training
-            if 'lora_' in name:
+            is_backbone = name.startswith('style_encoder') or name.startswith('content_encoder')
+            is_lora = 'lora_' in name
+            if freeze_backbone and is_backbone:
+                param.requires_grad = False
+                frozen_names.append(name)
+                continue
+            if is_lora:
                 param.requires_grad = True
+                lora_trainable.append(name)
                 continue
-            # Optionally freeze resnet encoders
-            if freeze_resnet and (name.startswith('style_encoder') or name.startswith('content_encoder')):
+            if name in loaded:
                 param.requires_grad = False
+                frozen_loaded_base.append(name)
                 continue
-            # Freeze backbone: all backbone weights (loaded or not) are not trained
-            if freeze_all_backbone or name in loaded:
-                param.requires_grad = False
-        # VAE lives outside the registered module tree but we still want to keep it frozen
+            param.requires_grad = True
+            if name in zeroed:
+                zero_trainable.append(name)
+            else:
+                other_trainable.append(name)
+
         if hasattr(self, 'vae_proxy') and len(self.vae_proxy) > 0:
-            for p in self.vae_proxy[0].parameters():
+            for p_name, p in self.vae_proxy[0].named_parameters():
                 p.requires_grad = False
+                frozen_names.append(f'vae_proxy.{p_name}')
+
+        self._param_policy_info = {
+            'frozen': frozen_names,
+            'frozen_loaded_base': frozen_loaded_base,
+            'zero_trainable': zero_trainable,
+            'lora_trainable': lora_trainable,
+            'other_trainable': other_trainable,
+        }
+
+    def log_param_report(self, preview: int = 12):
+        param_dict = dict(self.named_parameters())
+        info = getattr(self, '_param_policy_info', {})
+
+        def _section(title, names):
+            total_params = sum(param_dict[n].numel() for n in names if n in param_dict)
+            shown = names[:preview]
+            print(f'[{title}] count={len(names)}, #params={total_params}, showing first {len(shown)}', flush=True)
+            for n in shown:
+                p = param_dict.get(n, None)
+                shape = tuple(p.shape) if p is not None else 'N/A'
+                grad = getattr(p, 'requires_grad', None)
+                print(f'  - {n:60s} | shape={shape} | requires_grad={grad}', flush=True)
+            if len(names) > preview:
+                print(f'  ... ({len(names) - preview} more)', flush=True)
+
+        total = sum(p.numel() for p in param_dict.values())
+        trainable = sum(p.numel() for p in param_dict.values() if p.requires_grad)
+        print(f'[param report] total_params={total}, trainable_params={trainable}', flush=True)
+        _section('frozen', info.get('frozen', []))
+        _section('frozen_loaded_base', info.get('frozen_loaded_base', []))
+        _section('zero_trainable', info.get('zero_trainable', []))
+        _section('lora_trainable', info.get('lora_trainable', []))
+        _section('other_trainable', info.get('other_trainable', []))
+        if hasattr(self, 'vae_proxy') and len(self.vae_proxy) > 0:
+            vae_params = list(self.vae_proxy[0].named_parameters())
+            vae_count = sum(p.numel() for _, p in vae_params)
+            shown = vae_params[:preview]
+            print(f'[vae_proxy frozen] count={len(vae_params)}, #params={vae_count}, showing first {len(shown)}', flush=True)
+            for n, p in shown:
+                print(f'  - vae_proxy.{n:56s} | shape={tuple(p.shape)} | requires_grad={p.requires_grad}', flush=True)
+            if len(vae_params) > preview:
+                print(f'  ... ({len(vae_params) - preview} more)', flush=True)
 
     @classmethod
     def from_pretrained(
@@ -493,10 +565,22 @@ class StyleVAR(nn.Module):
         raw_ckpt = torch.load(pretrained_path, map_location=map_location)
         var_state = cls._extract_var_state_dict(raw_ckpt)
         model = cls(vae_local=vae_local, **kwargs)
-        loaded, zeroed = model._load_from_var_state(var_state, zero_unmatched=zero_unmatched)
-        if freeze_backbone:
-            model.freeze_loaded_parameters(freeze_resnet=freeze_resnet, freeze_all_backbone=True)
-        return model, {'loaded': loaded, 'zeroed': zeroed}
+        loaded, zeroed, pairs = model._load_from_var_state(var_state, zero_unmatched=zero_unmatched)
+        log_lines = ['[load mapping from VAR]']
+        for src, dst, shape in pairs:
+            log_lines.append(f'  {src:60s} -> {dst:60s} | shape={shape}')
+        log_path = os.path.join(os.getcwd(), 'load_mapping.log')
+        try:
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(log_lines))
+            print(f'[load mapping] entries={len(pairs)}, written to {log_path}', flush=True)
+        except Exception as e:
+            print(f'[load mapping] failed to write log ({e}); fallback to stdout.', flush=True)
+            for line in log_lines:
+                print(line, flush=True)
+        model.apply_training_policy(freeze_backbone=True)
+        model.log_param_report()
+        return model, {'loaded': loaded, 'zeroed': zeroed, 'pairs': pairs, 'policy': getattr(model, '_param_policy_info', {})}
 
 
 class VARHF(StyleVAR, PyTorchModelHubMixin):

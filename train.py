@@ -76,14 +76,12 @@ def _log_valid_samples_if_needed(args: arg_util.Args, trainer, tb_lg, global_ste
         style_vis = style_img[0].detach().cpu().mul(0.5).add_(0.5).clamp(0, 1)
         content_vis = content_img[0].detach().cpu().mul(0.5).add_(0.5).clamp(0, 1)
         out_vis = out[0].detach().cpu().clamp(0, 1)
-        # Ensure step is set before logging images
-        tb_lg.set_step(global_step)
-        # Log images with explicit step to ensure they're recorded correctly
+        # Log images using provided global_step to keep wandb steps aligned
         try:
-            tb_lg.log_image('valid/style', style_vis, step=global_step)
-            tb_lg.log_image('valid/content', content_vis, step=global_step)
-            tb_lg.log_image('valid/output', out_vis, step=global_step)
-            print(f'[valid] images logged to wandb/tensorboard at step {global_step}')
+            tb_lg.log_image('valid/style', style_vis, step=global_step+1)
+            tb_lg.log_image('valid/content', content_vis, step=global_step+1)
+            tb_lg.log_image('valid/output', out_vis, step=global_step+1)
+            print(f'[valid] images logged to wandb/tensorboard at step {global_step+1}')
         except Exception as e:
             print(f'[valid] failed to log images to wandb/tensorboard: {e}')
             import traceback
@@ -104,49 +102,38 @@ def build_everything(args: arg_util.Args):
     tb_lg: misc.LoggerGroup
     loggers = []
     with_tb_lg = dist.is_master()
-    wandb_logger = None
-    if with_tb_lg:
-        if args.use_wandb:
+    if with_tb_lg and args.use_wandb:
+        try:
+            import wandb
+            os.environ['WANDB_CONSOLE'] = 'wrap'
+            original_stdout = sys.stdout
+            original_stderr = sys.stderr
+            if isinstance(sys.stdout, misc.SyncPrint):
+                sys.stdout = sys.stdout.terminal_stream
+            if isinstance(sys.stderr, misc.SyncPrint):
+                sys.stderr = sys.stderr.terminal_stream
             try:
-                import wandb
-                # Set environment variable to avoid TTY issues
-                os.environ['WANDB_CONSOLE'] = 'wrap'
-                # Temporarily restore original stdout/stderr for wandb init
-                original_stdout = sys.stdout
-                original_stderr = sys.stderr
-                if isinstance(sys.stdout, misc.SyncPrint):
-                    sys.stdout = sys.stdout.terminal_stream
-                if isinstance(sys.stderr, misc.SyncPrint):
-                    sys.stderr = sys.stderr.terminal_stream
-                
-                try:
-                    wandb_run = wandb.init(
-                        project=args.wandb_project,
-                        name=args.wandb_run_name,
-                        config=args.state_dict(),
-                        dir=args.local_out_dir_path,
-                        settings=wandb.Settings(
-                            mode='online',
-                            console='wrap',  # Use wrap mode to avoid TTY issues
-                            _disable_stats=False,
-                        ),
-                    )
-                    wandb_logger = misc.WandbLogger(wandb_run)
-                    loggers.append(wandb_logger)
-                    print('[wandb] online logging enabled; tensorboard disabled')
-                finally:
-                    # Restore SyncPrint
-                    sys.stdout = original_stdout
-                    sys.stderr = original_stderr
-            except Exception as e:
-                import traceback
-                print(f'[warn] failed to init wandb: {e}')
-                print(f'[warn] wandb traceback: {traceback.format_exc()}')
-        else:
-            os.makedirs(args.tb_log_dir_path, exist_ok=True)
-            loggers.append(misc.TensorboardLogger(log_dir=args.tb_log_dir_path, filename_suffix=f'__{misc.time_str("%m%d_%H%M")}'))
+                wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    name=args.wandb_run_name,
+                    config=args.state_dict(),
+                    dir=args.local_out_dir_path,
+                    settings=wandb.Settings(
+                        mode='online',
+                        console='wrap',
+                        _disable_stats=False,
+                    ),
+                )
+                loggers.append(misc.WandbLogger(wandb_run))
+                print('[wandb] online logging enabled')
+            finally:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+        except Exception as e:
+            import traceback
+            print(f'[warn] failed to init wandb: {e}')
+            print(f'[warn] wandb traceback: {traceback.format_exc()}')
     tb_lg = misc.DistLogger(misc.LoggerGroup(*loggers), verbose=with_tb_lg)
-    tb_lg.flush()
     dist.barrier()
     
     # log args
@@ -337,7 +324,6 @@ def main_training():
             if ep < 3:
                 # noinspection PyArgumentList
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
-        tb_lg.set_step(ep * iters_train)
         
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
@@ -376,9 +362,10 @@ def main_training():
                 print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
             dist.barrier()
         
+        step_id = (ep + 1) * iters_train
         print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
-        tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
-        tb_lg.update(head='AR_z_burnout', step=ep+1, rest_hours=round(sec / 60 / 60, 2))
+        tb_lg.update(head='AR_ep_loss', step=step_id, **AR_ep_loss)
+        tb_lg.update(head='AR_z_burnout', step=step_id, rest_hours=round(sec / 60 / 60, 2))
         args.dump_log(); tb_lg.flush()
     
     total_time = f'{(time.time() - start_time) / 60 / 60:.1f}h'
@@ -473,20 +460,20 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
             dist.barrier()
 
         me.update(tlr=max_tlr)
-        tb_lg.set_step(step=g_it)
-        tb_lg.update(head='AR_opt_lr/lr_min', sche_tlr=min_tlr)
-        tb_lg.update(head='AR_opt_lr/lr_max', sche_tlr=max_tlr)
-        tb_lg.update(head='AR_opt_wd/wd_max', sche_twd=max_twd)
-        tb_lg.update(head='AR_opt_wd/wd_min', sche_twd=min_twd)
-        tb_lg.update(head='AR_opt_grad/fp16', scale_log2=scale_log2)
+        step_id = g_it + 1  # 1-based global step for logging
+        tb_lg.update(head='AR_opt_lr/lr_min', step=step_id, sche_tlr=min_tlr)
+        tb_lg.update(head='AR_opt_lr/lr_max', step=step_id, sche_tlr=max_tlr)
+        tb_lg.update(head='AR_opt_wd/wd_max', step=step_id, sche_twd=max_twd)
+        tb_lg.update(head='AR_opt_wd/wd_min', step=step_id, sche_twd=min_twd)
+        tb_lg.update(head='AR_opt_grad/fp16', step=step_id, scale_log2=scale_log2)
         
         if args.tclip > 0:
-            tb_lg.update(head='AR_opt_grad/grad', grad_norm=grad_norm)
-            tb_lg.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
+            tb_lg.update(head='AR_opt_grad/grad', step=step_id, grad_norm=grad_norm)
+            tb_lg.update(head='AR_opt_grad/grad', step=step_id, grad_clip=args.tclip)
         
         # Log system stats to wandb periodically (every 10 iterations to avoid overhead)
         if args.use_wandb and (g_it == 0 or (g_it + 1) % 10 == 0):
-            tb_lg.log_system_stats(step=g_it)
+            tb_lg.log_system_stats(step=step_id)
         
         # Flush wandb periodically to ensure data is sent
         if args.use_wandb and (g_it == 0 or (g_it + 1) % 50 == 0):

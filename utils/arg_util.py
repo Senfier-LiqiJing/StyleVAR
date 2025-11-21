@@ -42,8 +42,8 @@ class Args(Tap):
     data_path: str = os.path.join(PROJECT_ROOT, 'dataset')
     exp_name: str = 'style_var'
     vae_ckpt_path: str = os.path.join(PROJECT_ROOT, 'origin_checkpoints', 'vae_ch160v4096z32.pth')
-    clean_ckpt_path: str = os.path.join(PROJECT_ROOT, 'local_output', 'style_var_d16_clean_fp32.pth') # this path does not contain vqvae or trainer state
-    vanilla_ckpt_path:str = os.path.join(PROJECT_ROOT, 'origin_checkpoints', 'var_d16.pth')
+    clean_ckpt_path: str = os.path.join(PROJECT_ROOT, 'local_output', 'style_var_d20_clean_fp32.pth') # this path does not contain vqvae or trainer state
+    vanilla_ckpt_path:str = os.path.join(PROJECT_ROOT, 'origin_checkpoints', 'var_d20.pth')
     
     # VAE
     vfast: int = 0      # torch.compile VAE; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'
@@ -70,8 +70,8 @@ class Args(Tap):
     ac: int = 2             # gradient accumulation
 
     # LoRA/backbone controls
-    lora_r: int = 8
-    lora_alpha: float = 16.0
+    lora_r: int = 16
+    lora_alpha: float = 32.0
     lora_dropout: float = 0.05
     freeze_backbone: int = 1     # freeze copied VAR weights
     freeze_resnet: int = 1       # freeze style/content encoders

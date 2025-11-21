@@ -205,17 +205,12 @@ class TensorboardLogger(object):
 class WandbLogger(object):
     def __init__(self, run):
         self.run = run
-        self.step = 0
-        self.last_step = -1
-    
-    def set_step(self, step=None):
-        if step is None:
-            self.step += 1
-        else:
-            self.step = step
     
     def update(self, head='scalar', step=None, **kwargs):
         if self.run is None:
+            return
+        if step is None:
+            # Require explicit step for wandb to avoid drift
             return
         payload = {}
         for k, v in kwargs.items():
@@ -225,20 +220,15 @@ class WandbLogger(object):
                 v = v.item()
             payload[f'{head}/{k}'] = v
         if payload:
-            log_step = self.step if step is None else step
-            if log_step < 0:
-                return
-            if log_step <= self.last_step:
-                log_step = self.last_step + 1
             try:
-                # commit=False lets multiple logs share the same step cleanly
-                self.run.log(payload, step=log_step, commit=False)
-                self.last_step = log_step
+                self.run.log(payload, step=step, commit=False)
             except Exception as e:
                 print(f'[WandbLogger.update] failed to log: {e}')
     
     def log_image(self, tag, img_chw, step=None):
         if self.run is None:
+            return
+        if step is None:
             return
         try:
             import wandb
@@ -254,13 +244,7 @@ class WandbLogger(object):
                 # If already HWC or single image
                 img_to_log = wandb.Image(chw.numpy(), caption=tag)
             
-            log_step = self.step if step is None else step
-            if log_step < 0:
-                return
-            if log_step <= self.last_step:
-                log_step = self.last_step + 1
-            self.run.log({tag: img_to_log}, step=log_step, commit=False)
-            self.last_step = log_step
+            self.run.log({tag: img_to_log}, step=step, commit=False)
         except Exception as e:
             print(f'[WandbLogger.log_image] failed for tag {tag}: {e}')
             import traceback
@@ -269,6 +253,8 @@ class WandbLogger(object):
     def log_system_stats(self, step=None):
         """Log system statistics (GPU usage, memory, etc.) to wandb"""
         if self.run is None:
+            return
+        if step is None:
             return
         try:
             import wandb
@@ -281,23 +267,13 @@ class WandbLogger(object):
             stats['system/ram_used_gb'] = psutil.virtual_memory().used / (1024**3)
             stats['system/ram_total_gb'] = psutil.virtual_memory().total / (1024**3)
             
-            log_step = self.step if step is None else step
-            if log_step < 0:
-                return
-            if log_step <= self.last_step:
-                log_step = self.last_step + 1
-            self.run.log(stats, step=log_step, commit=False)
-            self.last_step = log_step
+            self.run.log(stats, step=step, commit=False)
         except Exception as e:
             # Silently fail if system monitoring fails
             pass
     
     def flush(self):
-        if self.run is not None:
-            try:
-                self.run.log({}, commit=True)  # Force commit any pending logs
-            except Exception as e:
-                pass  # Silently fail on flush errors
+        pass  # no-op to avoid unintended step commits
     
     def close(self):
         if self.run is not None:
@@ -313,12 +289,9 @@ class LoggerGroup(object):
         self.step = 0
     
     def set_step(self, step=None):
-        for lg in self.loggers:
-            lg.set_step(step)
         if step is not None:
             self.step = step
-        else:
-            self.step += 1
+        return self.step
     
     def update(self, head='scalar', step=None, **kwargs):
         for lg in self.loggers:
