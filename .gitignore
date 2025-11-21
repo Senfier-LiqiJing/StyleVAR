@@ -16,6 +16,5 @@ local_output*
 *.pth.tar
 *.ckpt
 *.log
-*.txt
 *.ipynb
 dataset/
