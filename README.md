@@ -1,1 +1,1 @@
-python train.py --data_path dataset --freeze_backbone 1 --freeze_resnet 1 --zero_unmatched 1 --bs 4 --ac 2 --ep 1 --save_every 2500 --valid_every 500 --use_wandb 1
+python train.py --data_path dataset --freeze_backbone 1 --freeze_resnet 1 --zero_unmatched 1 --bs 4 --ac 2 --ep 5 --save_every 2500 --valid_every 500 --use_wandb 1

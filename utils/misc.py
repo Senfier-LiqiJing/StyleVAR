@@ -206,6 +206,7 @@ class WandbLogger(object):
     def __init__(self, run):
         self.run = run
         self.step = 0
+        self.last_step = -1
     
     def set_step(self, step=None):
         if step is None:
@@ -227,9 +228,12 @@ class WandbLogger(object):
             log_step = self.step if step is None else step
             if log_step < 0:
                 return
+            if log_step <= self.last_step:
+                log_step = self.last_step + 1
             try:
                 # commit=False lets multiple logs share the same step cleanly
                 self.run.log(payload, step=log_step, commit=False)
+                self.last_step = log_step
             except Exception as e:
                 print(f'[WandbLogger.update] failed to log: {e}')
     
@@ -253,7 +257,10 @@ class WandbLogger(object):
             log_step = self.step if step is None else step
             if log_step < 0:
                 return
+            if log_step <= self.last_step:
+                log_step = self.last_step + 1
             self.run.log({tag: img_to_log}, step=log_step, commit=False)
+            self.last_step = log_step
         except Exception as e:
             print(f'[WandbLogger.log_image] failed for tag {tag}: {e}')
             import traceback
@@ -277,7 +284,10 @@ class WandbLogger(object):
             log_step = self.step if step is None else step
             if log_step < 0:
                 return
+            if log_step <= self.last_step:
+                log_step = self.last_step + 1
             self.run.log(stats, step=log_step, commit=False)
+            self.last_step = log_step
         except Exception as e:
             # Silently fail if system monitoring fails
             pass
