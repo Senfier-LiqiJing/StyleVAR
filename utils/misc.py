@@ -206,6 +206,7 @@ class WandbLogger(object):
     def __init__(self, run):
         self.run = run
         self.step = 0
+        # Initialize to -1 so that step 0 can be logged (will become 0 after first log)
         self.last_logged_step = -1  # Track the last step we actually logged to wandb
     
     def set_step(self, step=None):
@@ -236,7 +237,8 @@ class WandbLogger(object):
                 return
             
             # Ensure step is monotonically increasing
-            if log_step <= self.last_logged_step:
+            # If last_logged_step is -1 (initial state), allow step 0 to be logged
+            if self.last_logged_step >= 0 and log_step <= self.last_logged_step:
                 # Use the next available step
                 log_step = self.last_logged_step + 1
             
@@ -298,26 +300,8 @@ class WandbLogger(object):
             stats['system/ram_used_gb'] = psutil.virtual_memory().used / (1024**3)
             stats['system/ram_total_gb'] = psutil.virtual_memory().total / (1024**3)
             
-            # GPU stats
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    torch.cuda.set_device(i)
-                    stats[f'gpu_{i}/memory_allocated_gb'] = torch.cuda.memory_allocated(i) / (1024**3)
-                    stats[f'gpu_{i}/memory_reserved_gb'] = torch.cuda.memory_reserved(i) / (1024**3)
-                    stats[f'gpu_{i}/memory_max_allocated_gb'] = torch.cuda.max_memory_allocated(i) / (1024**3)
-                    # Reset max memory stats
-                    torch.cuda.reset_peak_memory_stats(i)
-                    
-                    # Try to get GPU utilization if nvidia-ml-py is available
-                    try:
-                        import pynvml
-                        pynvml.nvmlInit()
-                        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                        stats[f'gpu_{i}/utilization_percent'] = util.gpu
-                        stats[f'gpu_{i}/memory_utilization_percent'] = util.memory
-                    except:
-                        pass
+            # GPU stats (only if multiple GPUs, otherwise skip as system stats are sufficient)
+            # Note: Removed individual GPU stats as they're redundant with system stats
             
             # Determine the step to use
             if step is not None:
@@ -330,7 +314,8 @@ class WandbLogger(object):
                 return
             
             # Ensure step is monotonically increasing
-            if log_step <= self.last_logged_step:
+            # If last_logged_step is -1 (initial state), allow step 0 to be logged
+            if self.last_logged_step >= 0 and log_step <= self.last_logged_step:
                 log_step = self.last_logged_step + 1
             
             self.run.log(stats, step=log_step)
