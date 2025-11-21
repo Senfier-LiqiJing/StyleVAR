@@ -353,6 +353,23 @@ class StyleVARTrainer(object):
                 acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
             grad_value = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
             metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_value if grad_value is not None else 0.0)
+        
+        # Always log to wandb/tensorboard at every step (for real-time monitoring)
+        Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)).item()
+        acc_mean = (pred_BL == gt_BL).float().mean().item() * 100
+        if prog_si >= 0:
+            Ltail = acc_tail = -1
+        else:
+            Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)).item()
+            acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
+        grad_value = grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
+        tb_lg.update(
+            head='train_iter',
+            step=g_it,
+            Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail,
+            grad=grad_value if grad_value is not None else 0.0,
+            lr=self.var_opt.optimizer.param_groups[0]['lr'] if hasattr(self, 'var_opt') else None,
+        )
 
         if g_it == 0 or (g_it + 1) % 500 == 0:
             prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()

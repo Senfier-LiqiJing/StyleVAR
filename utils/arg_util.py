@@ -24,6 +24,18 @@ import dist
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
+def _infer_depth_from_ckpt_path(ckpt_path: str) -> Optional[int]:
+    """Infer VAR depth from vanilla checkpoint filename like `var_d16.pth`."""
+    base = os.path.basename(ckpt_path or '')
+    mat = re.search(r'(?:^|[_-])d(\d+)(?!\d)', base.lower())
+    if not mat:
+        return None
+    try:
+        return int(mat.group(1))
+    except Exception:
+        return None
+
+
 class Args(Tap):
     #data_path: str = '/path/to/imagenet'
     #data_path: str = '/home/OmniStyle-150k-tensor'
@@ -100,6 +112,14 @@ class Args(Tap):
     pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
     pg0: int = 4            # progressive initial stage, 0: from the 1st token map, 1: from the 2nd token map, etc
     pgwp: float = 0         # num of warmup epochs at each progressive stage
+    
+    # validation / logging
+    valid_every: int = 0     # 0: disable periodic inference logging
+    valid_style_path: str = os.path.join(PROJECT_ROOT, 'test_pics', 'style1.jpg')
+    valid_content_path: str = os.path.join(PROJECT_ROOT, 'test_pics', 'content1.png')
+    use_wandb: int = 0
+    wandb_project: str = 'style-var'
+    wandb_run_name: str = ''
     
     # would be automatically set in runtime
     cmd: str = ' '.join(sys.argv[1:])  # [automatically set; don't specify this]
@@ -251,6 +271,11 @@ def init_dist_and_get_args():
         if args.data_path == '/path/to/imagenet':
             raise ValueError(f'{"*"*40}  please specify --data_path=/path/to/imagenet  {"*"*40}')
     
+    inferred_depth = _infer_depth_from_ckpt_path(args.vanilla_ckpt_path)
+    if inferred_depth is not None and args.depth == Args.depth:
+        print(f'[args] depth inferred from vanilla_ckpt_path -> {inferred_depth}')
+        args.depth = inferred_depth
+    
     # normalize alpha / boolean-like flags
     if isinstance(args.alpha_nums, str):
         try:
@@ -261,6 +286,8 @@ def init_dist_and_get_args():
     args.freeze_resnet = bool(args.freeze_resnet)
     args.zero_unmatched = bool(args.zero_unmatched)
     args.save_every = int(args.save_every or 0)
+    args.valid_every = int(args.valid_every or 0)
+    args.use_wandb = bool(args.use_wandb)
     
     # warn args.extra_args
     if len(args.extra_args) > 0:
@@ -319,5 +346,6 @@ def init_dist_and_get_args():
         f'__b{args.bs}ep{args.ep}{args.opt[:4]}lr{args.tblr:g}wd{args.twd:g}'
     )
     args.tb_log_dir_path = os.path.join(args.local_out_dir_path, tb_name)
+    args.wandb_run_name = args.wandb_run_name or tb_name
     
     return args

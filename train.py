@@ -9,28 +9,137 @@ from functools import partial
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torchvision import transforms
+from torchvision.utils import save_image
+from PIL import Image
 
 import dist
 from utils import arg_util, misc
 from utils.data import build_dataset
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils.misc import auto_resume
+from utils.data import normalize_01_into_pm1
+
+
+_valid_cache = {}
+
+
+def _build_valid_transform(reso: int, mid_reso_mult: float):
+    mid_reso = round(reso * mid_reso_mult)
+    return transforms.Compose([
+        transforms.Resize(mid_reso, interpolation=transforms.InterpolationMode.LANCZOS),
+        transforms.CenterCrop(reso),
+        transforms.ToTensor(),
+        normalize_01_into_pm1,
+    ])
+
+
+def _get_cached_valid_imgs(args: arg_util.Args):
+    device = args.device
+    cache = _valid_cache.get('imgs')
+    if cache is not None and cache['style'].device == device and cache['content'].device == device:
+        return cache['style'], cache['content']
+    tfm = _build_valid_transform(args.data_load_reso, args.mid_reso)
+    if not os.path.isfile(args.valid_style_path) or not os.path.isfile(args.valid_content_path):
+        raise FileNotFoundError(f'valid style/content images not found: {args.valid_style_path}, {args.valid_content_path}')
+    style = tfm(Image.open(args.valid_style_path).convert('RGB')).unsqueeze(0).to(device)
+    content = tfm(Image.open(args.valid_content_path).convert('RGB')).unsqueeze(0).to(device)
+    _valid_cache['imgs'] = {'style': style, 'content': content}
+    return style, content
+
+
+@torch.no_grad()
+def _log_valid_samples_if_needed(args: arg_util.Args, trainer, tb_lg, global_step: int):
+    if args.valid_every <= 0:
+        return
+    if (global_step + 1) % args.valid_every != 0:
+        return
+    if not dist.is_master():
+        return
+    try:
+        print(f'[valid] step={global_step+1} using style={args.valid_style_path}, content={args.valid_content_path}')
+        style_img, content_img = _get_cached_valid_imgs(args)
+        was_training = trainer.var_wo_ddp.training
+        trainer.var_wo_ddp.eval()
+        out = trainer.var_wo_ddp.autoregressive_infer_cfg(
+            B=1,
+            style_img=style_img,
+            content_img=content_img,
+            g_seed=args.seed,
+            cfg=1.5,
+            top_k=0,
+            top_p=0.0,
+            more_smooth=False,
+        )
+        if was_training:
+            trainer.var_wo_ddp.train()
+        style_vis = style_img[0].detach().cpu().mul(0.5).add_(0.5).clamp(0, 1)
+        content_vis = content_img[0].detach().cpu().mul(0.5).add_(0.5).clamp(0, 1)
+        out_vis = out[0].detach().cpu().clamp(0, 1)
+        # Ensure step is set before logging images
+        tb_lg.set_step(global_step)
+        tb_lg.log_image('valid/style', style_vis, step=global_step)
+        tb_lg.log_image('valid/content', content_vis, step=global_step)
+        tb_lg.log_image('valid/output', out_vis, step=global_step)
+        save_dir = os.path.join(args.local_out_dir_path, 'valid_outputs')
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, f'step{global_step+1}.png')
+        save_image(out_vis, out_path)
+        print(f'[valid] output saved to {out_path} (also logged to wandb/tensorboard if enabled)')
+    except Exception as exc:
+        print(f'[valid inference] failed at step {global_step}: {exc}')
 
 
 def build_everything(args: arg_util.Args):
     # resume
     auto_resume_info, start_ep, start_it, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
     # create tensorboard logger
-    tb_lg: misc.TensorboardLogger
+    tb_lg: misc.LoggerGroup
+    loggers = []
     with_tb_lg = dist.is_master()
+    wandb_logger = None
     if with_tb_lg:
-        os.makedirs(args.tb_log_dir_path, exist_ok=True)
-        # noinspection PyTypeChecker
-        tb_lg = misc.DistLogger(misc.TensorboardLogger(log_dir=args.tb_log_dir_path, filename_suffix=f'__{misc.time_str("%m%d_%H%M")}'), verbose=True)
-        tb_lg.flush()
-    else:
-        # noinspection PyTypeChecker
-        tb_lg = misc.DistLogger(None, verbose=False)
+        if args.use_wandb:
+            try:
+                import wandb
+                # Set environment variable to avoid TTY issues
+                os.environ['WANDB_CONSOLE'] = 'wrap'
+                # Temporarily restore original stdout/stderr for wandb init
+                original_stdout = sys.stdout
+                original_stderr = sys.stderr
+                if isinstance(sys.stdout, misc.SyncPrint):
+                    sys.stdout = sys.stdout.terminal_stream
+                if isinstance(sys.stderr, misc.SyncPrint):
+                    sys.stderr = sys.stderr.terminal_stream
+                
+                try:
+                    wandb_run = wandb.init(
+                        project=args.wandb_project,
+                        name=args.wandb_run_name,
+                        config=args.state_dict(),
+                        dir=args.local_out_dir_path,
+                        settings=wandb.Settings(
+                            mode='online',
+                            console='wrap',  # Use wrap mode to avoid TTY issues
+                            _disable_stats=False,
+                        ),
+                    )
+                    wandb_logger = misc.WandbLogger(wandb_run)
+                    loggers.append(wandb_logger)
+                    print('[wandb] online logging enabled; tensorboard disabled')
+                finally:
+                    # Restore SyncPrint
+                    sys.stdout = original_stdout
+                    sys.stderr = original_stderr
+            except Exception as e:
+                import traceback
+                print(f'[warn] failed to init wandb: {e}')
+                print(f'[warn] wandb traceback: {traceback.format_exc()}')
+        else:
+            os.makedirs(args.tb_log_dir_path, exist_ok=True)
+            loggers.append(misc.TensorboardLogger(log_dir=args.tb_log_dir_path, filename_suffix=f'__{misc.time_str("%m%d_%H%M")}'))
+    tb_lg = misc.DistLogger(misc.LoggerGroup(*loggers), verbose=with_tb_lg)
+    tb_lg.flush()
     dist.barrier()
     
     # log args
@@ -236,8 +345,6 @@ def main_training():
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
         is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
-        # step-level saving
-        step_save = args.save_every > 0 and (g_it + 1) % args.save_every == 0
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
@@ -261,18 +368,6 @@ def main_training():
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
                 print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
             dist.barrier()
-        elif step_save:
-            if dist.is_local_master():
-                local_out_ckpt = os.path.join(args.local_out_dir_path, f'ar-ckpt-step{g_it+1}.pth')
-                print(f'[saving ckpt @ step {g_it+1}] ...', end='', flush=True)
-                torch.save({
-                    'epoch':    ep,
-                    'iter':     it+1,
-                    'trainer':  trainer.state_dict(),
-                    'args':     args.state_dict(),
-                }, local_out_ckpt)
-                print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
-            dist.barrier()
         
         print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
         tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
@@ -294,7 +389,7 @@ def main_training():
     dist.barrier()
 
 
-def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer):
+def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.LoggerGroup, ld_or_itrt, iters_train: int, trainer):
     # import heavy packages after Dataloader object creation
     from trainer import VARTrainer
     from utils.lr_control import lr_wd_annealing
@@ -381,6 +476,16 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         if args.tclip > 0:
             tb_lg.update(head='AR_opt_grad/grad', grad_norm=grad_norm)
             tb_lg.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
+        
+        # Log system stats to wandb periodically (every 10 iterations to avoid overhead)
+        if args.use_wandb and (g_it == 0 or (g_it + 1) % 10 == 0):
+            tb_lg.log_system_stats(step=g_it)
+        
+        # Flush wandb periodically to ensure data is sent
+        if args.use_wandb and (g_it == 0 or (g_it + 1) % 50 == 0):
+            tb_lg.flush()
+        
+        _log_valid_samples_if_needed(args, trainer, tb_lg, g_it)
     
         if dist.is_local_master():
             pbar.set_postfix({

@@ -95,6 +95,28 @@ class SyncPrint(object):
         self.terminal_stream.flush()
         self.file_stream.flush()
     
+    def isatty(self):
+        """Return True if the stream is interactive (a TTY)."""
+        return hasattr(self.terminal_stream, 'isatty') and self.terminal_stream.isatty()
+    
+    def fileno(self):
+        """Return the file descriptor number of the stream."""
+        if hasattr(self.terminal_stream, 'fileno'):
+            return self.terminal_stream.fileno()
+        return -1
+    
+    def readable(self):
+        """Return True if the stream can be read from."""
+        return hasattr(self.terminal_stream, 'readable') and self.terminal_stream.readable()
+    
+    def writable(self):
+        """Return True if the stream can be written to."""
+        return True
+    
+    def seekable(self):
+        """Return True if the stream supports random access."""
+        return False
+    
     def close(self):
         if not self.enabled:
             return
@@ -178,6 +200,203 @@ class TensorboardLogger(object):
     
     def close(self):
         self.writer.close()
+
+
+class WandbLogger(object):
+    def __init__(self, run):
+        self.run = run
+        self.step = 0
+        self.last_logged_step = -1  # Track the last step we actually logged to wandb
+    
+    def set_step(self, step=None):
+        if step is None:
+            self.step += 1
+        else:
+            self.step = step
+    
+    def update(self, head='scalar', step=None, **kwargs):
+        if self.run is None:
+            return
+        payload = {}
+        for k, v in kwargs.items():
+            if v is None:
+                continue
+            if hasattr(v, 'item'):
+                v = v.item()
+            payload[f'{head}/{k}'] = v
+        if payload:
+            # Determine the step to use
+            if step is not None:
+                log_step = step
+            else:
+                log_step = self.step
+            
+            # Skip negative steps (they're used for initialization in tensorboard but not needed for wandb)
+            if log_step < 0:
+                return
+            
+            # Ensure step is monotonically increasing
+            if log_step <= self.last_logged_step:
+                # Use the next available step
+                log_step = self.last_logged_step + 1
+            
+            try:
+                self.run.log(payload, step=log_step, commit=True)
+                self.last_logged_step = max(self.last_logged_step, log_step)
+            except Exception as e:
+                print(f'[WandbLogger.update] failed to log: {e}')
+            
+            # Update internal step to ensure it's always >= last_logged_step
+            self.step = max(self.step, self.last_logged_step)
+    
+    def log_image(self, tag, img_chw, step=None):
+        if self.run is None:
+            return
+        try:
+            import wandb
+            chw = img_chw.detach().cpu()
+            # Ensure values are in [0, 1] range
+            if chw.max() > 1.0:
+                chw = chw / 255.0
+            chw = chw.clamp(0, 1)
+            # Convert CHW to HWC for wandb
+            if chw.dim() == 3:
+                img_to_log = wandb.Image(chw.permute(1, 2, 0).numpy(), caption=tag)
+            else:
+                # If already HWC or single image
+                img_to_log = wandb.Image(chw.numpy(), caption=tag)
+            
+            # Determine the step to use
+            if step is not None:
+                log_step = step
+            else:
+                log_step = self.step
+            
+            # Ensure step is monotonically increasing
+            if log_step <= self.last_logged_step:
+                log_step = self.last_logged_step + 1
+            
+            self.run.log({tag: img_to_log}, step=log_step)
+            self.last_logged_step = max(self.last_logged_step, log_step)
+            # Update internal step
+            self.step = max(self.step, log_step)
+        except Exception as e:
+            print(f'[WandbLogger.log_image] failed: {e}')
+    
+    def log_system_stats(self, step=None):
+        """Log system statistics (GPU usage, memory, etc.) to wandb"""
+        if self.run is None:
+            return
+        try:
+            import wandb
+            import psutil
+            stats = {}
+            
+            # CPU and RAM
+            stats['system/cpu_percent'] = psutil.cpu_percent(interval=None)
+            stats['system/ram_percent'] = psutil.virtual_memory().percent
+            stats['system/ram_used_gb'] = psutil.virtual_memory().used / (1024**3)
+            stats['system/ram_total_gb'] = psutil.virtual_memory().total / (1024**3)
+            
+            # GPU stats
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    torch.cuda.set_device(i)
+                    stats[f'gpu_{i}/memory_allocated_gb'] = torch.cuda.memory_allocated(i) / (1024**3)
+                    stats[f'gpu_{i}/memory_reserved_gb'] = torch.cuda.memory_reserved(i) / (1024**3)
+                    stats[f'gpu_{i}/memory_max_allocated_gb'] = torch.cuda.max_memory_allocated(i) / (1024**3)
+                    # Reset max memory stats
+                    torch.cuda.reset_peak_memory_stats(i)
+                    
+                    # Try to get GPU utilization if nvidia-ml-py is available
+                    try:
+                        import pynvml
+                        pynvml.nvmlInit()
+                        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                        stats[f'gpu_{i}/utilization_percent'] = util.gpu
+                        stats[f'gpu_{i}/memory_utilization_percent'] = util.memory
+                    except:
+                        pass
+            
+            # Determine the step to use
+            if step is not None:
+                log_step = step
+            else:
+                log_step = self.step
+            
+            # Skip negative steps
+            if log_step < 0:
+                return
+            
+            # Ensure step is monotonically increasing
+            if log_step <= self.last_logged_step:
+                log_step = self.last_logged_step + 1
+            
+            self.run.log(stats, step=log_step)
+            self.last_logged_step = max(self.last_logged_step, log_step)
+            # Update internal step
+            self.step = max(self.step, self.last_logged_step)
+        except Exception as e:
+            # Silently fail if system monitoring fails
+            pass
+    
+    def flush(self):
+        if self.run is not None:
+            try:
+                self.run.log({}, commit=True)  # Force commit any pending logs
+            except Exception as e:
+                pass  # Silently fail on flush errors
+    
+    def close(self):
+        if self.run is not None:
+            try:
+                self.run.finish()
+            except Exception as e:
+                print(f'[WandbLogger.close] failed: {e}')
+
+
+class LoggerGroup(object):
+    def __init__(self, *loggers):
+        self.loggers = [lg for lg in loggers if lg is not None]
+        self.step = 0
+    
+    def set_step(self, step=None):
+        for lg in self.loggers:
+            lg.set_step(step)
+        if step is not None:
+            self.step = step
+        else:
+            self.step += 1
+    
+    def update(self, head='scalar', step=None, **kwargs):
+        for lg in self.loggers:
+            lg.update(head=head, step=step, **kwargs)
+    
+    def log_image(self, tag, img_chw, step=None):
+        for lg in self.loggers:
+            log_fn = getattr(lg, 'log_image', None)
+            if callable(log_fn):
+                log_fn(tag, img_chw, step=step)
+    
+    def log_system_stats(self, step=None):
+        """Log system statistics to all loggers that support it"""
+        for lg in self.loggers:
+            log_fn = getattr(lg, 'log_system_stats', None)
+            if callable(log_fn):
+                log_fn(step=step)
+    
+    def flush(self):
+        for lg in self.loggers:
+            flush = getattr(lg, 'flush', None)
+            if callable(flush):
+                flush()
+    
+    def close(self):
+        for lg in self.loggers:
+            close = getattr(lg, 'close', None)
+            if callable(close):
+                close()
 
 
 class SmoothedValue(object):
