@@ -494,15 +494,17 @@ class StyleVAR(nn.Module):
                 param.requires_grad = True
                 lora_trainable.append(name)
                 continue
+            # New (unmatched) non-LoRA params should train: force requires_grad=True if they were zero-initialized
+            if name in zeroed:
+                param.requires_grad = True
+                zero_trainable.append(name)
+                continue
             if name in loaded:
                 param.requires_grad = False
                 frozen_loaded_base.append(name)
                 continue
             param.requires_grad = True
-            if name in zeroed:
-                zero_trainable.append(name)
-            else:
-                other_trainable.append(name)
+            other_trainable.append(name)
 
         if hasattr(self, 'vae_proxy') and len(self.vae_proxy) > 0:
             for p_name, p in self.vae_proxy[0].named_parameters():
