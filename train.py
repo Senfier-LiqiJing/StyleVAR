@@ -356,7 +356,20 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
             it=it, g_it=g_it, stepping=stepping, metric_lg=me, tb_lg=tb_lg,
             target_B3HW=target, style_B3HW=style, content_B3HW=content, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
         )
-        
+
+        if args.save_every > 0 and (g_it + 1) % args.save_every == 0:
+            if dist.is_local_master():
+                local_out_ckpt = os.path.join(args.local_out_dir_path, f'ar-ckpt-step{g_it+1}.pth')
+                print(f'[saving ckpt @ step {g_it+1}] ...', end='', flush=True)
+                torch.save({
+                    'epoch':    ep,
+                    'iter':     it+1,
+                    'trainer':  trainer.state_dict(),
+                    'args':     args.state_dict(),
+                }, local_out_ckpt)
+                print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
+            dist.barrier()
+
         me.update(tlr=max_tlr)
         tb_lg.set_step(step=g_it)
         tb_lg.update(head='AR_opt_lr/lr_min', sche_tlr=min_tlr)

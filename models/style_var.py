@@ -460,16 +460,19 @@ class StyleVAR(nn.Module):
         self._loaded_param_names = loaded_keys
         return loaded_keys, zeroed_keys
 
-    def freeze_loaded_parameters(self, freeze_resnet: bool = True):
+    def freeze_loaded_parameters(self, freeze_resnet: bool = True, freeze_all_backbone: bool = True):
         loaded = getattr(self, '_loaded_param_names', set())
         for name, param in self.named_parameters():
+            # LoRA adapters continue training
             if 'lora_' in name:
                 param.requires_grad = True
                 continue
+            # Optionally freeze resnet encoders
             if freeze_resnet and (name.startswith('style_encoder') or name.startswith('content_encoder')):
                 param.requires_grad = False
                 continue
-            if name in loaded:
+            # Freeze backbone: all backbone weights (loaded or not) are not trained
+            if freeze_all_backbone or name in loaded:
                 param.requires_grad = False
         # VAE lives outside the registered module tree but we still want to keep it frozen
         if hasattr(self, 'vae_proxy') and len(self.vae_proxy) > 0:
@@ -492,7 +495,7 @@ class StyleVAR(nn.Module):
         model = cls(vae_local=vae_local, **kwargs)
         loaded, zeroed = model._load_from_var_state(var_state, zero_unmatched=zero_unmatched)
         if freeze_backbone:
-            model.freeze_loaded_parameters(freeze_resnet=freeze_resnet)
+            model.freeze_loaded_parameters(freeze_resnet=freeze_resnet, freeze_all_backbone=True)
         return model, {'loaded': loaded, 'zeroed': zeroed}
 
 
