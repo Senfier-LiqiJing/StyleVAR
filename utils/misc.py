@@ -274,16 +274,28 @@ class WandbLogger(object):
             else:
                 log_step = self.step
             
-            # Ensure step is monotonically increasing
-            if log_step <= self.last_logged_step:
-                log_step = self.last_logged_step + 1
+            # Skip negative steps
+            if log_step < 0:
+                return
             
-            self.run.log({tag: img_to_log}, step=log_step)
+            # Ensure step is monotonically increasing
+            # If last_logged_step is -1 (initial state), allow step 0 to be logged
+            # For images, if the provided step is less than last_logged_step, use the next available step
+            original_step = log_step
+            if self.last_logged_step >= 0 and log_step <= self.last_logged_step:
+                log_step = self.last_logged_step + 1
+                # Only warn if step was adjusted (not for initial step 0)
+                if original_step > 0:
+                    print(f'[WandbLogger.log_image] adjusted step from {original_step} to {log_step} for tag {tag} to maintain monotonicity')
+            
+            self.run.log({tag: img_to_log}, step=log_step, commit=True)
             self.last_logged_step = max(self.last_logged_step, log_step)
             # Update internal step
-            self.step = max(self.step, log_step)
+            self.step = max(self.step, self.last_logged_step)
         except Exception as e:
-            print(f'[WandbLogger.log_image] failed: {e}')
+            print(f'[WandbLogger.log_image] failed for tag {tag}: {e}')
+            import traceback
+            print(f'[WandbLogger.log_image] traceback: {traceback.format_exc()}')
     
     def log_system_stats(self, step=None):
         """Log system statistics (GPU usage, memory, etc.) to wandb"""

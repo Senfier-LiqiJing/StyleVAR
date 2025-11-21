@@ -78,14 +78,21 @@ def _log_valid_samples_if_needed(args: arg_util.Args, trainer, tb_lg, global_ste
         out_vis = out[0].detach().cpu().clamp(0, 1)
         # Ensure step is set before logging images
         tb_lg.set_step(global_step)
-        tb_lg.log_image('valid/style', style_vis, step=global_step)
-        tb_lg.log_image('valid/content', content_vis, step=global_step)
-        tb_lg.log_image('valid/output', out_vis, step=global_step)
+        # Log images with explicit step to ensure they're recorded correctly
+        try:
+            tb_lg.log_image('valid/style', style_vis, step=global_step)
+            tb_lg.log_image('valid/content', content_vis, step=global_step)
+            tb_lg.log_image('valid/output', out_vis, step=global_step)
+            print(f'[valid] images logged to wandb/tensorboard at step {global_step}')
+        except Exception as e:
+            print(f'[valid] failed to log images to wandb/tensorboard: {e}')
+            import traceback
+            print(f'[valid] traceback: {traceback.format_exc()}')
         save_dir = os.path.join(args.local_out_dir_path, 'valid_outputs')
         os.makedirs(save_dir, exist_ok=True)
         out_path = os.path.join(save_dir, f'step{global_step+1}.png')
         save_image(out_vis, out_path)
-        print(f'[valid] output saved to {out_path} (also logged to wandb/tensorboard if enabled)')
+        print(f'[valid] output saved to {out_path}')
     except Exception as exc:
         print(f'[valid inference] failed at step {global_step}: {exc}')
 
