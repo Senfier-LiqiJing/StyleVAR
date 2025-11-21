@@ -206,8 +206,6 @@ class WandbLogger(object):
     def __init__(self, run):
         self.run = run
         self.step = 0
-        # Initialize to -1 so that step 0 can be logged (will become 0 after first log)
-        self.last_logged_step = -1  # Track the last step we actually logged to wandb
     
     def set_step(self, step=None):
         if step is None:
@@ -226,30 +224,14 @@ class WandbLogger(object):
                 v = v.item()
             payload[f'{head}/{k}'] = v
         if payload:
-            # Determine the step to use
-            if step is not None:
-                log_step = step
-            else:
-                log_step = self.step
-            
-            # Skip negative steps (they're used for initialization in tensorboard but not needed for wandb)
+            log_step = self.step if step is None else step
             if log_step < 0:
                 return
-            
-            # Ensure step is monotonically increasing
-            # If last_logged_step is -1 (initial state), allow step 0 to be logged
-            if self.last_logged_step >= 0 and log_step <= self.last_logged_step:
-                # Use the next available step
-                log_step = self.last_logged_step + 1
-            
             try:
-                self.run.log(payload, step=log_step, commit=True)
-                self.last_logged_step = max(self.last_logged_step, log_step)
+                # commit=False lets multiple logs share the same step cleanly
+                self.run.log(payload, step=log_step, commit=False)
             except Exception as e:
                 print(f'[WandbLogger.update] failed to log: {e}')
-            
-            # Update internal step to ensure it's always >= last_logged_step
-            self.step = max(self.step, self.last_logged_step)
     
     def log_image(self, tag, img_chw, step=None):
         if self.run is None:
@@ -268,30 +250,10 @@ class WandbLogger(object):
                 # If already HWC or single image
                 img_to_log = wandb.Image(chw.numpy(), caption=tag)
             
-            # Determine the step to use
-            if step is not None:
-                log_step = step
-            else:
-                log_step = self.step
-            
-            # Skip negative steps
+            log_step = self.step if step is None else step
             if log_step < 0:
                 return
-            
-            # Ensure step is monotonically increasing
-            # If last_logged_step is -1 (initial state), allow step 0 to be logged
-            # For images, if the provided step is less than last_logged_step, use the next available step
-            original_step = log_step
-            if self.last_logged_step >= 0 and log_step <= self.last_logged_step:
-                log_step = self.last_logged_step + 1
-                # Only warn if step was adjusted (not for initial step 0)
-                if original_step > 0:
-                    print(f'[WandbLogger.log_image] adjusted step from {original_step} to {log_step} for tag {tag} to maintain monotonicity')
-            
-            self.run.log({tag: img_to_log}, step=log_step, commit=True)
-            self.last_logged_step = max(self.last_logged_step, log_step)
-            # Update internal step
-            self.step = max(self.step, self.last_logged_step)
+            self.run.log({tag: img_to_log}, step=log_step, commit=False)
         except Exception as e:
             print(f'[WandbLogger.log_image] failed for tag {tag}: {e}')
             import traceback
@@ -312,28 +274,10 @@ class WandbLogger(object):
             stats['system/ram_used_gb'] = psutil.virtual_memory().used / (1024**3)
             stats['system/ram_total_gb'] = psutil.virtual_memory().total / (1024**3)
             
-            # GPU stats (only if multiple GPUs, otherwise skip as system stats are sufficient)
-            # Note: Removed individual GPU stats as they're redundant with system stats
-            
-            # Determine the step to use
-            if step is not None:
-                log_step = step
-            else:
-                log_step = self.step
-            
-            # Skip negative steps
+            log_step = self.step if step is None else step
             if log_step < 0:
                 return
-            
-            # Ensure step is monotonically increasing
-            # If last_logged_step is -1 (initial state), allow step 0 to be logged
-            if self.last_logged_step >= 0 and log_step <= self.last_logged_step:
-                log_step = self.last_logged_step + 1
-            
-            self.run.log(stats, step=log_step)
-            self.last_logged_step = max(self.last_logged_step, log_step)
-            # Update internal step
-            self.step = max(self.step, self.last_logged_step)
+            self.run.log(stats, step=log_step, commit=False)
         except Exception as e:
             # Silently fail if system monitoring fails
             pass
