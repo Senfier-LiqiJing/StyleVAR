@@ -1,0 +1,1 @@
+python infer_style_var.py --ckpt local_output/ar-ckpt-step400.pth --vae_ckpt origin_checkpoints/vae_ch160v4096z32.pth --content test_pics/content1.png --style test_pics/style1.jpg --out demo_out.png
