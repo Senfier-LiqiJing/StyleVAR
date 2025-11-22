@@ -476,7 +476,7 @@ class StyleVAR(nn.Module):
         self._zero_initialized_param_names = set(zeroed_keys)
         return loaded_keys, zeroed_keys, loaded_pairs
 
-    def apply_training_policy(self, freeze_backbone: bool = True):
+    def apply_training_policy(self, freeze_backbone: bool = True, freeze_resnet: bool = True):
         loaded = getattr(self, '_loaded_param_names', set())
         zeroed = set(getattr(self, '_zero_initialized_param_names', set()))
 
@@ -484,9 +484,9 @@ class StyleVAR(nn.Module):
         zero_trainable, lora_trainable, other_trainable = [], [], []
 
         for name, param in self.named_parameters():
-            is_backbone = name.startswith('style_encoder') or name.startswith('content_encoder')
+            is_resnet = name.startswith('style_encoder') or name.startswith('content_encoder')
             is_lora = 'lora_' in name
-            if freeze_backbone and is_backbone:
+            if freeze_resnet and is_resnet:
                 param.requires_grad = False
                 frozen_names.append(name)
                 continue
@@ -499,7 +499,7 @@ class StyleVAR(nn.Module):
                 param.requires_grad = True
                 zero_trainable.append(name)
                 continue
-            if name in loaded:
+            if freeze_backbone and name in loaded:
                 param.requires_grad = False
                 frozen_loaded_base.append(name)
                 continue
@@ -580,7 +580,7 @@ class StyleVAR(nn.Module):
             print(f'[load mapping] failed to write log ({e}); fallback to stdout.', flush=True)
             for line in log_lines:
                 print(line, flush=True)
-        model.apply_training_policy(freeze_backbone=True)
+        model.apply_training_policy(freeze_backbone=freeze_backbone, freeze_resnet=freeze_resnet)
         model.log_param_report()
         return model, {'loaded': loaded, 'zeroed': zeroed, 'pairs': pairs, 'policy': getattr(model, '_param_policy_info', {})}
 
