@@ -42,8 +42,8 @@ class Args(Tap):
     data_path: str = os.path.join(PROJECT_ROOT, 'dataset')
     exp_name: str = 'style_var'
     vae_ckpt_path: str = os.path.join(PROJECT_ROOT, 'origin_checkpoints', 'vae_ch160v4096z32.pth')
-    clean_ckpt_path: str = os.path.join(PROJECT_ROOT, 'local_output', 'style_var_d20_clean_fp32.pth') # this path does not contain vqvae or trainer state
-    vanilla_ckpt_path:str = os.path.join(PROJECT_ROOT, 'origin_checkpoints', 'var_d20.pth')
+    clean_ckpt_path: str = os.path.join(PROJECT_ROOT, 'local_output', 'style_var_d16_clean_fp32.pth') # this path does not contain vqvae or trainer state
+    vanilla_ckpt_path:str = os.path.join(PROJECT_ROOT, 'origin_checkpoints', 'var_d16.pth')
     
     # VAE
     vfast: int = 0      # torch.compile VAE; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'

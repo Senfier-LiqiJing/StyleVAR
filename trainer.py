@@ -124,7 +124,10 @@ class VARTrainer(object):
         
         # log
         pred_BL = logits_BLV.data.argmax(dim=-1)
-        if it == 0 or it in metric_lg.log_iters:
+        # If log_iters is empty (typical when using tqdm instead of MetricLogger.log_every),
+        # log every iteration so the console stats reflect current training instead of only it=0.
+        should_log = (not metric_lg.log_iters) or it == 0 or it in metric_lg.log_iters
+        if should_log:
             Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)).item()
             acc_mean = (pred_BL == gt_BL).float().mean().item() * 100
             if prog_si >= 0:    # in progressive training
@@ -343,7 +346,8 @@ class StyleVARTrainer(object):
         grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping)
 
         pred_BL = logits_BLV.data.argmax(dim=-1)
-        if it == 0 or it in metric_lg.log_iters:
+        should_log = (not metric_lg.log_iters) or it == 0 or it in metric_lg.log_iters
+        if should_log:
             Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)).item()
             acc_mean = (pred_BL == gt_BL).float().mean().item() * 100
             if prog_si >= 0:
