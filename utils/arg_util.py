@@ -42,7 +42,7 @@ class Args(Tap):
     alng: float = 1e-5  # the multiplier of ada_lin.w[gamma channels]'s initialization
     # VAR optimization
     fp16: int = 0           # 1: using fp16, 2: bf16
-    tblr: float = 5e-4      # base lr
+    tblr: float = 1e-4      # base lr
     tlr: float = None       # lr = base lr * (bs / 256)
     twd: float = 0.05       # initial wd
     twde: float = 0         # final wd, =twde or twd
@@ -59,7 +59,7 @@ class Args(Tap):
     wp0: float = 0.005      # initial lr ratio at the begging of lr warm up
     wpe: float = 0.01       # final lr ratio at the end of training
     #sche: str = 'lin0'      # lr schedule
-    sche: str = 'lin1'      # lr schedule
+    sche: str = 'lin0'      # lr schedule
     
     opt: str = 'adamw'      # lion: https://cloud.tencent.com/developer/article/2336657?areaId=106001 lr=5e-5 (0.25x) wd=0.8 (8x); Lion needs a large bs to work
     afuse: bool = True      # fused adamw
@@ -187,7 +187,7 @@ class Args(Tap):
                     'is_master': dist.is_master(), 
                     'name': getattr(self, 'exp_name', 'unknown'), 
                     'cmd': getattr(self, 'cmd', 'unknown'), 
-                    'commit': getattr(self, 'commit_id', 'unknown'), # <--- 修复点
+                    'commit': getattr(self, 'commit_id', 'unknown'), 
                     'branch': getattr(self, 'branch', 'unknown'), 
                     'tb_log_dir_path': getattr(self, 'tb_log_dir_path', 'unknown')
                 }
