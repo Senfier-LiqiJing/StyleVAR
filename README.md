@@ -72,9 +72,9 @@ Formally, the style image tokens are denoted as $S = \{s^1, s^2, \ldots, s^K\} =
 
 The generation of the target image, denoted as $R = \{r^1, r^2, \ldots, r^K\}$, proceeds in a scale-wise autoregressive manner:
 
-$$P(x|x_s, x_c) = \prod_{k=1}^{K} P(r^k | r^{<k}, s^k, c^k)$$
+$$P(x|x_s, x_c) = \prod_{k=1}^{K} P(r^k | r^{1:k-1}, s^k, c^k)$$
 
-where $r^k$ denotes the target features at the $k$-th scale, and $r^{<k} = r^{1:k-1}$ represents the history of generated target features prior to the $k$-th scale.
+where $r^k$ denotes the target features at the $k$-th scale, and $r^{1:k-1}$ represents the history of generated target features prior to the $k$-th scale.
 
 #### Model Structure
 
@@ -88,7 +88,7 @@ Where:
 - $\alpha_k$: Heuristic hyperparameter governing the blending ratio between style and content information
 - Keys ($K$) and Values ($V$): Target feature history
 
-![StyleVAR Framework](assets/figure1_framework.png)
+![StyleVAR Framework](assets/framework.png)
 *Figure 1: The framework of the proposed StyleVAR. The Blended Cross-Attention mechanism injects style and content information into the autoregressive generation process.*
 
 ### 2.2 Training and Inference
@@ -255,14 +255,16 @@ We benchmarked StyleVAR on 500 randomly selected style-content image pairs:
 
 ### 3.3 Training Dynamics
 
-![Training Loss and Accuracy](assets/figure2_training.png)
+![Training Loss and Accuracy](assets/training_dynamics.png)
 *Figure 2: Loss and accuracy of training set across iterations. The model demonstrates consistent convergence with both mean accuracy and tail accuracy improving throughout training.*
+
+> Note: Training dynamics visualization to be added. The model achieved 14.72% mean accuracy and 16.26% tail accuracy after 8 epochs.
 
 ### 3.4 Qualitative Analysis
 
 Generated samples demonstrate that StyleVAR successfully transfers artistic textures while maintaining the semantic structure of content images:
 
-![Qualitative Results](assets/figure3_results.png)
+![Qualitative Results](assets/sample.png)
 *Figure 3: The generated images demonstrate that the model successfully transfers texture while maintaining the semantic structure of the content. (Left: Content Image, Middle: Style Image, Right: Generated Output)*
 
 **Observations**:
