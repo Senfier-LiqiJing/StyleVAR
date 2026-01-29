@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Project Page](https://img.shields.io/badge/Project-Page-green)](https://github.com/Senfier-LiqiJing/StyleVAR)
 
-**StyleVAR** is a reference-based image style transfer framework built upon Visual Autoregressive Modeling (VAR). This work formulates style transfer as conditional discrete sequence modeling in a multi-scale latent space, introducing a novel **Blended Cross-Attention** mechanism to balance content preservation and style intensity. The autoregressive generation is based on image only, not containing any text information. The method preserves structural semantics of the content image while adopting the artistic texture of the style image through a principled attention-based conditioning strategy.
+**StyleVAR** is a reference-based image style transfer framework built upon Visual Autoregressive Modeling (VAR). This work formulates style transfer as conditional discrete sequence modeling in a multi-scale latent space, introducing a novel **Blended Cross-Attention** mechanism to balance content preservation and style intensity. The autoregressive generation is based on **Image Only**, not containing any text information. The method preserves structural semantics of the content image while adopting the artistic texture of the style image through a principled attention-based conditioning strategy.
 
 > **Authors**: Liqi Jing, Dingming Zhang, Peinian Li
 > **Affiliation**: Duke University
