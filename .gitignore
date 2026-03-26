@@ -20,3 +20,4 @@ local_output*
 !requirements.txt
 *.ipynb
 data
+flash_attn-2.8.0+cu121torch2.4-cp310-cp310-linux_x86_64.whl
