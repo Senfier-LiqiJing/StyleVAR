@@ -11,7 +11,7 @@ echo "=== Creating conda env: ${ENV_NAME} (Python ${PYTHON_VERSION}) ==="
 conda create -n ${ENV_NAME} python=${PYTHON_VERSION} -y
 
 echo "=== Activating ${ENV_NAME} ==="
-eval "$(conda init bash 2>/dev/null)"
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate ${ENV_NAME}
 
 echo "=== Installing CUDA toolkit 12.1 ==="
@@ -20,6 +20,9 @@ conda install nvidia/label/cuda-12.1.0::cuda-toolkit -y
 echo "=== Installing PyTorch 2.4.0 + CUDA 12.1 ==="
 pip install torch==2.4.0+cu121 torchvision==0.19.0+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
+
+echo "=== Installing flash-attn build deps ==="
+pip install psutil packaging setuptools wheel
 
 echo "=== Installing flash-attn (requires CUDA build) ==="
 pip install flash-attn==2.6.3 --no-build-isolation
