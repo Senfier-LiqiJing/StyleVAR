@@ -80,6 +80,19 @@ class Args(Tap):
     hflip: bool = False         # augmentation: horizontal flip
     workers: int = 6        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
     
+    # alpha jitter (blended cross-attention robustness)
+    alpha_jitter: float = 0.0       # >0 to jitter alpha during training (e.g. 0.15)
+
+    # curriculum mixed fine-tuning (set new_data_path to enable)
+    new_data_path: str = ''         # root of *extracted* ImagePulse data (empty = disabled)
+    new_data_tar_dir: str = ''      # directory containing raw .tar.gz (auto-extracted if new_data_path missing)
+    curriculum_start: float = 0.3   # initial ratio of new-dataset samples
+    curriculum_end: float = 0.7     # final ratio of new-dataset samples
+
+    # checkpointing
+    save_every: int = 2000          # save rolling checkpoint every N iterations (0 = disabled)
+    max_rolling: int = 5            # number of rolling checkpoint slots
+
     # progressive training
     pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
     pg0: int = 4            # progressive initial stage, 0: from the 1st token map, 1: from the 2nd token map, etc

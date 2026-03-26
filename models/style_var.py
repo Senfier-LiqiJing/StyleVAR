@@ -46,6 +46,7 @@ class StyleVAR(nn.Module):
         
         self.patch_nums: Tuple[int] = patch_nums
         self.alpha_nums: Tuple[float] = alpha_nums
+        self.alpha_jitter: float = 0.0   # set > 0 to enable alpha jitter during training
         self.L = sum(pn ** 2 for pn in self.patch_nums)
         self.first_l = self.patch_nums[0] ** 2
         self.begin_ends = []
@@ -139,103 +140,139 @@ class StyleVAR(nn.Module):
         return self.head(self.head_nm(h.float(), cond_BD).float()).float()
     
     @torch.no_grad()
-    def autoregressive_infer_cfg(
+    def autoregressive_infer(
         self, B: int,
-        style_img: torch.Tensor, content_img: torch.Tensor, # B,3,H,W in [0,1]
-        g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
+        style_img: torch.Tensor, content_img: torch.Tensor,   # (B,3,H,W) in [-1,1]
+        g_seed: Optional[int] = None, top_k=0, top_p=0.0,
         more_smooth=False,
-    ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
+        style_strength: float = 0.0,
+    ) -> torch.Tensor:
         """
-        only used for inference, on autoregressive mode
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
+        Autoregressive inference **without** classifier-free guidance.
+        Works with arbitrary batch size B.
+
+        :param B:  batch size (must match style_img.shape[0] and content_img.shape[0])
+        :param style_img:   (B,3,H,W) style reference images in [-1,1]
+        :param content_img: (B,3,H,W) content images in [-1,1]
+        :param g_seed:  random seed (None = non-deterministic)
+        :param top_k:   top-k sampling (0 = disabled)
+        :param top_p:   top-p sampling (0.0 = disabled)
+        :param more_smooth: use gumbel-softmax instead of argmax (visualization only)
+        :param style_strength: in [-1, 1].  0 = default balance;
+               +1 = max style (all alphas ↑);  -1 = max content (all alphas ↓).
+               Requires the model to be trained with alpha_jitter > 0 for best results.
+        :return: generated images (B,3,H,W) in [0,1]
         """
-        
-        # fix g_seed for stable generation
-        if g_seed is None: rng = None
-        else: self.rng.manual_seed(g_seed); rng = self.rng
-        
-        # style-var relys on input images for generation, not class
-        #if label_B is None:
-        #    label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
-        #elif isinstance(label_B, int):
-        #    label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
-        
-        # style-var relys on input images for generation
-        # sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
-        sos = self.feat_emb(self.content_encoder(content_img).squeeze(-1).squeeze(-1))
+        # Compute effective alphas with user-controlled style-content balance
+        if style_strength != 0.0:
+            shift = style_strength * 0.5   # maps [-1,1] → [-0.5, +0.5] shift
+            effective_alphas = tuple(
+                max(0.01, min(0.99, a + shift)) for a in self.alpha_nums)
+        else:
+            effective_alphas = self.alpha_nums
+
+        if g_seed is None:
+            rng = None
+        else:
+            self.rng.manual_seed(g_seed); rng = self.rng
+
+        # ---- condition embeddings (B, C) ----
+        sos     = self.feat_emb(self.content_encoder(content_img).squeeze(-1).squeeze(-1))
         cond_BD = self.feat_emb(self.style_encoder(style_img).squeeze(-1).squeeze(-1))
-        
-        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC  # lvl_embed: 1L -> 1LC, pos_1LC:1LC, lvl_pos:1LC
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        
-        # encode the style & content image
-        ms_style_idx = self.vae_proxy[0].img_to_idxBl(style_img)
-        ms_style_BlCv = self.vae_quant_proxy[0].msBllist_to_BlCv_list(ms_style_idx)
-        ms_style_BlC = [self.word_embed(item) for item in ms_style_BlCv]
-        ms_content_idx = self.vae_proxy[0].img_to_idxBl(content_img)
+
+        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC   # (1, L, C)
+
+        # SOS → first token map  (B, first_l, C)
+        next_token_map = (
+            sos.unsqueeze(1).expand(B, self.first_l, -1)
+            + self.pos_start.expand(B, self.first_l, -1)
+            + lvl_pos[:, :self.first_l]
+        )
+
+        # ---- VQ-VAE multi-scale tokenisation of style & content ----
+        ms_style_idx   = self.vae_proxy[0].img_to_idxBl(style_img)
+        ms_style_BlCv  = self.vae_quant_proxy[0].msBllist_to_BlCv_list(ms_style_idx)
+        ms_style_BlC   = [self.word_embed(item) for item in ms_style_BlCv]
+
+        ms_content_idx  = self.vae_proxy[0].img_to_idxBl(content_img)
         ms_content_BlCv = self.vae_quant_proxy[0].msBllist_to_BlCv_list(ms_content_idx)
-        ms_content_BlC = [self.word_embed(item) for item in ms_content_BlCv]
-        
+        ms_content_BlC  = [self.word_embed(item) for item in ms_content_BlCv]
+
+        # add level + position embeddings  (broadcasts from (1,pn²,C) to (B,pn²,C))
         cur_L = 0
-        for idx, style_BlC in enumerate(ms_style_BlC):
-            style_BlC += lvl_pos[:,cur_L:cur_L+self.patch_nums[idx]**2]
-            ms_style_BlC[idx] = style_BlC.expand(2*B,self.patch_nums[idx]**2,-1)
-            cur_L += self.patch_nums[idx]**2
-        
-        cur_L = 0
-        for idx, content_BlC in enumerate(ms_content_BlC):
-            content_BlC += lvl_pos[:,cur_L:cur_L+self.patch_nums[idx]**2]
-            ms_content_BlC[idx] = content_BlC.expand(2*B,self.patch_nums[idx]**2,-1)
-            cur_L += self.patch_nums[idx]**2
+        for idx_s in range(len(self.patch_nums)):
+            pn = self.patch_nums[idx_s]
+            pos = lvl_pos[:, cur_L:cur_L + pn * pn]            # (1, pn², C)
+            ms_style_BlC[idx_s]   = ms_style_BlC[idx_s]   + pos
+            ms_content_BlC[idx_s] = ms_content_BlC[idx_s] + pos
+            cur_L += pn * pn
+
+        # cumulative feature map  (B, Cvae, max_pn, max_pn)
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+
+        # ---- scale-by-scale autoregressive generation ----
+        for blk in self.blocks:
+            blk.attn.kv_caching(True)
 
         cur_L = 0
-        # f_hat: B,Cvae,16,16
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-        
-        for b in self.blocks: b.attn.kv_caching(True)
-        for si, pn in enumerate(self.patch_nums):   # si: i-th segment
-            ratio = si / self.num_stages_minus_1 # 0,1/9,2/9,3/9,...
-            # last_L = cur_L
-            cur_L += pn*pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+        for si, pn in enumerate(self.patch_nums):
+            cur_L += pn * pn
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+
             x = next_token_map
-            AdaLNCrossAttn.forward
-            for b in self.blocks:
-                x = b(x=x, style=ms_style_BlC[si], content=ms_content_BlC[si], cond_BD=cond_BD_or_gss, attn_bias = None, alpha = self.alpha_nums[si])
-                # x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD) # C -> D(C) -> V    shape:2B, l, V
-            
-            # t is defined to control the power of condition in terms of general case
-            t = cfg * ratio # cfg = 1.5
-            # the previous and latter B batch are conditional and unconditional for generation.
-            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
-            
-            # get top-k or top-p logits, which is the index for codebook, and the output size is B,l
-            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            if not more_smooth: # this is the default case
-                # for each element in array idx_bl, it is expressed by Cvae dimensions
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
-            else:   # not used when evaluating FID/IS/Precision/Recall
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
-                h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
+            for blk in self.blocks:
+                x = blk(x=x, style=ms_style_BlC[si], content=ms_content_BlC[si],
+                        cond_BD=cond_BD_or_gss, attn_bias=None,
+                        alpha=effective_alphas[si])
+
+            logits_BlV = self.get_logits(x, cond_BD)           # (B, pn², V)
+
+            # ---- sample (no CFG) ----
+            idx_Bl = sample_with_top_k_top_p_(
+                logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1,
+            )[:, :, 0]                                          # (B, pn²)
+
+            if not more_smooth:
+                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)          # (B, pn², Cvae)
+            else:
+                ratio = si / self.num_stages_minus_1
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                h_BChw = gumbel_softmax_with_rng(
+                    logits_BlV.mul(1 + ratio), tau=gum_t, hard=False,
+                    dim=-1, rng=rng,
+                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-            if si != self.num_stages_minus_1:   # prepare for next stage
+            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
+                si, len(self.patch_nums), f_hat, h_BChw)
+
+            if si != self.num_stages_minus_1:
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
-        
-        for b in self.blocks: b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+                next_token_map = (
+                    self.word_embed(next_token_map)
+                    + lvl_pos[:, cur_L:cur_L + self.patch_nums[si + 1] ** 2]
+                )
+                # NO repeat(2,1,1) — no CFG batch doubling
+
+        for blk in self.blocks:
+            blk.attn.kv_caching(False)
+
+        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # [-1,1] → [0,1]
+
+    # kept for backward compatibility; delegates to autoregressive_infer (ignoring cfg)
+    @torch.no_grad()
+    def autoregressive_infer_cfg(
+        self, B: int,
+        style_img: torch.Tensor, content_img: torch.Tensor,
+        g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
+        more_smooth=False,
+    ) -> torch.Tensor:
+        """Legacy wrapper — CFG is not supported (no unconditional training).
+        Calls :meth:`autoregressive_infer` directly, ignoring ``cfg``."""
+        return self.autoregressive_infer(
+            B, style_img, content_img,
+            g_seed=g_seed, top_k=top_k, top_p=top_p, more_smooth=more_smooth,
+        )
     
     def forward(self, x_BLCv_wo_first_l: torch.Tensor, style_BLCvae: torch.Tensor, content_BLCvae: torch.tensor, style_img:torch.tensor, content_img:torch.tensor) -> torch.Tensor:  # returns logits_BLV
         """
@@ -278,6 +315,14 @@ class StyleVAR(nn.Module):
         # alpha in training should be a tensor, since multi-stage logits is output simultanously and no single alpha should be allowd.
         # alpha in inference only need to take one scalar.
         alpha_map_tensor = torch.tensor(self.alpha_nums, device=x_BLC.device, dtype=x_BLC.dtype)
+
+        # Alpha jitter: random global shift during training for robustness
+        # (also enables user-controllable style_strength at inference)
+        if self.training and self.alpha_jitter > 0:
+            shift = torch.empty(1, device=x_BLC.device, dtype=x_BLC.dtype).uniform_(
+                -self.alpha_jitter, self.alpha_jitter)
+            alpha_map_tensor = (alpha_map_tensor + shift).clamp_(0.01, 0.99)
+
         lvls_1_ed = self.lvl_1L[:, :ed]
         lvls_B_ed = lvls_1_ed.expand(B, -1)
         alpha_tensor_B_ed = alpha_map_tensor[lvls_B_ed]

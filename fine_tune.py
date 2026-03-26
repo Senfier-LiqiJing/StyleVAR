@@ -44,23 +44,35 @@ def build_everything(args: arg_util.Args):
     print(f'initial args:\n{str(args)}')
    
     # build data
+    curriculum_dataset = None   # will be set if curriculum mixed training
     if not args.local_debug:
         print(f'[build PT data] ...\n')
-        # NOTE: This assumes your build_dataset function is modified
-        # to return a dataset that yields (target, style, content) tuples.
-        # The original return `num_classes` is no longer used for the model.
-        _, dataset_train, dataset_val = build_dataset(
-            args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso,
-        )
+        if args.new_data_path or args.new_data_tar_dir:
+            # ---- Curriculum mixed fine-tuning ----
+            from utils.data import build_curriculum_dataset
+            _, dataset_train, dataset_val = build_curriculum_dataset(
+                old_data_path=args.data_path,
+                new_data_path=args.new_data_path,
+                new_data_tar_dir=args.new_data_tar_dir,
+                final_reso=args.data_load_reso,
+                start_ratio=args.curriculum_start,
+                hflip=args.hflip, mid_reso=args.mid_reso,
+            )
+            curriculum_dataset = dataset_train  # keep ref for ratio updates
+        else:
+            # ---- Original OmniStyle-only training ----
+            _, dataset_train, dataset_val = build_dataset(
+                args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso,
+            )
         types = str((type(dataset_train).__name__, type(dataset_val).__name__))
-        
+
         ld_val = DataLoader(
             dataset_val, num_workers=0, pin_memory=True,
             batch_size=round(args.batch_size*1.5), sampler=EvalDistributedSampler(dataset_val, num_replicas=dist.get_world_size(), rank=dist.get_rank()),
             shuffle=False, drop_last=False,
         )
         del dataset_val
-        
+
         ld_train = DataLoader(
             dataset=dataset_train, num_workers=args.workers, pin_memory=True,
             generator=args.get_different_generator_for_each_rank(), # worker_init_fn=worker_init_fn,
@@ -69,7 +81,8 @@ def build_everything(args: arg_util.Args):
                 shuffle=True, fill_last=True, rank=dist.get_rank(), world_size=dist.get_world_size(), start_ep=start_ep, start_it=start_it,
             ),
         )
-        del dataset_train
+        if curriculum_dataset is None:
+            del dataset_train
         
         [print(line) for line in auto_resume_info]
         print(f'[dataloader multi processing] ...', end='', flush=True)
@@ -103,17 +116,43 @@ def build_everything(args: arg_util.Args):
         style_enc_dim=512
     )
    
-    # modify to your own path
-    vae_ckpt = '/home/PML-Project/checkpoints/vae_ch160v4096z32.pth'
-    if dist.is_local_master():
-        if not os.path.exists(vae_ckpt):
-            os.system(f'wget https://huggingface.co/FoundationVision/var/resolve/main/{vae_ckpt}')
+    # VAE checkpoint path
+    vae_ckpt = os.path.join(os.path.dirname(__file__), 'ckpt', 'vae_ch160v4096z32.pth')
+    if not os.path.exists(vae_ckpt):
+        raise FileNotFoundError(f"VAE checkpoint not found: {vae_ckpt}")
     dist.barrier()
     vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
    
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     # --- MODIFIED TYPE HINT ---
     var_wo_ddp: StyleVAR = args.compile_model(var_wo_ddp, args.tfast)
+
+    # Alpha jitter for blended cross-attention robustness
+    if hasattr(args, 'alpha_jitter') and args.alpha_jitter > 0:
+        var_wo_ddp.alpha_jitter = args.alpha_jitter
+        if dist.is_local_master():
+            print(f"[Config] Alpha jitter enabled: ±{args.alpha_jitter}")
+
+    # ================================================================
+    # [OPTIONAL] High-rank LoRA — uncomment below if OOM on full-param
+    # Requires:  pip install peft
+    # ================================================================
+    # from peft import LoraConfig, get_peft_model
+    # lora_config = LoraConfig(
+    #     r=64,                          # high rank for visual generation (try 64 or 128)
+    #     lora_alpha=128,                # scaling = alpha / r
+    #     target_modules=[
+    #         "mat_qkv_guide",           # cross-attn guide QKV
+    #         "mat_qkv_target",          # cross-attn target QKV
+    #         "proj",                    # attn output projection
+    #         # "fc1", "fc2",            # uncomment to also adapt FFN layers
+    #     ],
+    #     lora_dropout=0.05,
+    #     bias="none",
+    # )
+    # var_wo_ddp = get_peft_model(var_wo_ddp, lora_config)
+    # var_wo_ddp.print_trainable_parameters()
+    # ================================================================
 
     is_resuming = (trainer_state is not None) and (len(trainer_state) > 0)
 
@@ -281,28 +320,39 @@ def build_everything(args: arg_util.Args):
     dist.barrier()
     return (
         tb_lg, trainer, start_ep, start_it,
-        iters_train, ld_train, ld_val
+        iters_train, ld_train, ld_val,
+        curriculum_dataset,             # None when not using curriculum
     )
 
 def main_training():
     args: arg_util.Args = arg_util.init_dist_and_get_args()
     if args.local_debug:
         torch.autograd.set_detect_anomaly(True)
-    
+
     (
         tb_lg, trainer,
         start_ep, start_it,
-        iters_train, ld_train, ld_val
+        iters_train, ld_train, ld_val,
+        curriculum_dataset,
     ) = build_everything(args)
     print("[INIT] Build Everything Ready.")
-    
+
     # train
     start_time = time.time()
     best_L_mean, best_L_tail, best_acc_mean, best_acc_tail = 999., 999., -1., -1.
     best_val_loss_mean, best_val_loss_tail, best_val_acc_mean, best_val_acc_tail = 999, 999, -1, -1
-    
+
     L_mean, L_tail = -1, -1
     for ep in range(start_ep, args.ep):
+        # ---- Curriculum ratio update (linear schedule) ----
+        if curriculum_dataset is not None:
+            progress = ep / max(args.ep - 1, 1)
+            ratio = args.curriculum_start + \
+                    (args.curriculum_end - args.curriculum_start) * progress
+            curriculum_dataset.set_new_data_ratio(ratio)
+            if dist.is_local_master():
+                print(f'[Curriculum] Ep {ep}: new_data_ratio = {ratio:.3f}')
+
         if hasattr(ld_train, 'sampler') and hasattr(ld_train.sampler, 'set_epoch'):
             ld_train.sampler.set_epoch(ep)
             if ep < 3:
@@ -331,18 +381,21 @@ def main_training():
             print(f' [*] [ep{ep}]  (val {tot})  Lm: {L_mean:.4f}, Lt: {L_tail:.4f}, Acc m&t: {acc_mean:.2f} {acc_tail:.2f},  Val cost: {cost:.2f}s')
             
             if dist.is_local_master():
-                local_out_ckpt = os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth')
-                local_out_ckpt_best = os.path.join(args.local_out_dir_path, 'ar-ckpt-best.pth')
-                print(f'[saving ckpt] ...', end='', flush=True)
-                torch.save({
+                ckpt_state = {
                     'epoch':    ep+1,
                     'iter':     0,
                     'trainer':  trainer.state_dict(),
                     'args':     args.state_dict(),
-                }, local_out_ckpt)
+                }
+                # --- Permanent per-epoch checkpoint ---
+                ep_path = misc.save_epoch_checkpoint(ckpt_state, args.local_out_dir_path, ep+1)
+                print(f'[saving ckpt] permanent epoch ckpt @ {ep_path}', flush=True, clean=True)
+                # --- ar-ckpt-last.pth (backwards compat) ---
+                misc.atomic_save(ckpt_state, os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'))
+                # --- ar-ckpt-best.pth ---
                 if best_updated:
-                    shutil.copy(local_out_ckpt, local_out_ckpt_best)
-                print(f'         [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
+                    shutil.copy(os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'),
+                                os.path.join(args.local_out_dir_path, 'ar-ckpt-best.pth'))
             dist.barrier()
         
         print(    f'         [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
@@ -440,7 +493,23 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         if args.tclip > 0:
             tb_lg.update(head='AR_opt_grad/grad', grad_norm=grad_norm)
             tb_lg.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
-    
+
+        # --- Rolling checkpoint every save_every iterations ---
+        if args.save_every > 0 and (it + 1) % args.save_every == 0 and dist.is_local_master():
+            roll_state = {
+                'epoch':   ep,
+                'iter':    it + 1,
+                'trainer': trainer.state_dict(),
+                'args':    args.state_dict(),
+            }
+            roll_path = misc.save_rolling_checkpoint(
+                roll_state, args.local_out_dir_path,
+                max_slots=args.max_rolling,
+            )
+            # also keep ar-ckpt-last.pth up to date
+            misc.atomic_save(roll_state, os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'))
+            print(f'[rolling ckpt] ep{ep} it{it+1}/{iters_train} -> {os.path.basename(roll_path)}', flush=True, clean=True)
+
     me.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in me.meters.items()}, me.iter_time.time_preds(max_it - (g_it + 1) + (args.ep - ep) * 15)  # +15: other cost
 

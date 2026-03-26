@@ -341,6 +341,38 @@ def glob_with_latest_modified_first(pattern, recursive=False):
     return sorted(glob.glob(pattern, recursive=recursive), key=os.path.getmtime, reverse=True)
 
 
+def atomic_save(state: dict, path: str):
+    """Save checkpoint atomically: write to tmp then rename."""
+    tmp = path + '.tmp'
+    torch.save(state, tmp)
+    os.replace(tmp, path)   # atomic on POSIX
+
+
+def save_rolling_checkpoint(state: dict, out_dir: str, max_slots: int = 5):
+    """
+    Save to rolling checkpoint slots ``ar-ckpt-roll-0.pth`` … ``ar-ckpt-roll-{max_slots-1}.pth``.
+    Overwrites the oldest slot (by mtime).
+    """
+    slots = [os.path.join(out_dir, f'ar-ckpt-roll-{i}.pth') for i in range(max_slots)]
+    # pick oldest existing slot, or first empty slot
+    target = None
+    for s in slots:
+        if not os.path.exists(s):
+            target = s
+            break
+    if target is None:
+        target = min(slots, key=os.path.getmtime)
+    atomic_save(state, target)
+    return target
+
+
+def save_epoch_checkpoint(state: dict, out_dir: str, epoch: int):
+    """Save a permanent per-epoch checkpoint."""
+    path = os.path.join(out_dir, f'ar-ckpt-ep{epoch}.pth')
+    atomic_save(state, path)
+    return path
+
+
 def auto_resume(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List[str], int, int, dict, dict]:
     info = []
     file = os.path.join(args.local_out_dir_path, pattern)
@@ -349,12 +381,21 @@ def auto_resume(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List[str], in
         info.append(f'[auto_resume] no ckpt found @ {file}')
         info.append(f'[auto_resume quit]')
         return info, 0, 0, {}, {}
-    else:
-        info.append(f'[auto_resume] load ckpt from @ {all_ckpt[0]} ...')
-        ckpt = torch.load(all_ckpt[0], map_location='cpu')
-        ep, it = ckpt['epoch'], ckpt['iter']
-        info.append(f'[auto_resume success] resume from ep{ep}, it{it}')
-        return info, ep, it, ckpt['trainer'], ckpt['args']
+
+    # Try each candidate from newest to oldest; skip corrupted files
+    for ckpt_path in all_ckpt:
+        try:
+            ckpt = torch.load(ckpt_path, map_location='cpu')
+            ep, it = ckpt['epoch'], ckpt['iter']
+            info.append(f'[auto_resume] loaded ckpt @ {ckpt_path}')
+            info.append(f'[auto_resume success] resume from ep{ep}, it{it}')
+            return info, ep, it, ckpt['trainer'], ckpt['args']
+        except Exception as e:
+            info.append(f'[auto_resume] SKIPPING corrupted {ckpt_path}: {e}')
+            continue
+
+    info.append(f'[auto_resume] all checkpoints corrupted, starting fresh')
+    return info, 0, 0, {}, {}
 
 
 def create_npz_from_sample_folder(sample_folder: str):
