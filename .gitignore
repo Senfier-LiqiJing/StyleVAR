@@ -17,5 +17,6 @@ local_output*
 *.ckpt
 *.log
 *.txt
+!requirements.txt
 *.ipynb
 data

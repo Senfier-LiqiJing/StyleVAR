@@ -1,0 +1,19 @@
+# StyleVAR dependencies
+# Install with: pip install -r requirements.txt
+# PyTorch must be installed first (see setup_env.sh)
+
+einops==0.8.2
+flash-attn==2.6.3
+lpips==0.1.4
+numpy>=2.0
+pillow>=12.0
+scipy>=1.15
+tensorboard>=2.20
+torch==2.4.0+cu121
+torchvision==0.19.0+cu121
+tqdm>=4.60
+transformers>=5.0
+huggingface_hub>=1.0
+safetensors>=0.7
+pyyaml>=6.0
+typed-argument-parser>=1.11
