@@ -27,6 +27,8 @@ class Args(Tap):
     #data_path: str = '/home/OmniStyle-150k-tensor'
     data_path: str = '/home/OmniStyle-150K'
     exp_name: str = 'style_var'
+    wandb_project: str = 'StyleVAR'    # wandb project name (empty to disable)
+    wandb_entity: str = ''              # wandb entity/team (empty for default)
     clean_ckpt_path: str = '/home/PML-Project/local_output/style_var_d20_clean_fp32.pth' # this path does not contain vqvae or trainer state
     vanilla_ckpt_path:str = "/home/PML-Project/checkpoints/var_d20.pth"
     
@@ -90,7 +92,7 @@ class Args(Tap):
     curriculum_end: float = 0.7     # final ratio of new-dataset samples
 
     # checkpointing
-    save_every: int = 2000          # save rolling checkpoint every N iterations (0 = disabled)
+    save_every: int = 200           # save rolling checkpoint every N iterations (0 = disabled)
     max_rolling: int = 5            # number of rolling checkpoint slots
 
     # progressive training
@@ -119,7 +121,7 @@ class Args(Tap):
     finish_time: str = ''       # [automatically set; don't specify this]
     
     # environment
-    local_out_dir_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'local_output')  # [automatically set; don't specify this]
+    local_out_dir_path: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'local_output')  # output directory for logs and checkpoints
     tb_log_dir_path: str = '...tb-...'  # [automatically set; don't specify this]
     log_txt_path: str = '...'           # [automatically set; don't specify this]
     last_ckpt_path: str = '...'         # [automatically set; don't specify this]

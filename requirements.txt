@@ -17,3 +17,4 @@ huggingface_hub>=1.0
 safetensors>=0.7
 pyyaml>=6.0
 typed-argument-parser>=1.11
+wandb>=0.17

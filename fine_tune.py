@@ -38,7 +38,26 @@ def build_everything(args: arg_util.Args):
         # noinspection PyTypeChecker
         tb_lg = misc.DistLogger(None, verbose=False)
     dist.barrier()
-   
+
+    # ---- wandb ----
+    wandb_run = None
+    if dist.is_master() and args.wandb_project:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity or None,
+                name=args.exp_name,
+                config={k: v for k, v in args.state_dict().items()
+                        if not k.startswith('cur_') and k not in
+                        {'device', 'remain_time', 'finish_time'}},
+                resume='allow',
+            )
+            print(f'[wandb] Initialized: {wandb_run.url}')
+        except Exception as e:
+            print(f'[wandb] Failed to init: {e}, continuing without wandb')
+            wandb_run = None
+
     # log args
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
@@ -322,6 +341,7 @@ def build_everything(args: arg_util.Args):
         tb_lg, trainer, start_ep, start_it,
         iters_train, ld_train, ld_val,
         curriculum_dataset,             # None when not using curriculum
+        wandb_run,
     )
 
 def main_training():
@@ -334,6 +354,7 @@ def main_training():
         start_ep, start_it,
         iters_train, ld_train, ld_val,
         curriculum_dataset,
+        wandb_run,
     ) = build_everything(args)
     print("[INIT] Build Everything Ready.")
 
@@ -360,7 +381,8 @@ def main_training():
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
         stats, (sec, remain_time, finish_time) = train_one_ep(
-            ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
+            ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer,
+            wandb_run=wandb_run,
         )
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
@@ -387,27 +409,35 @@ def main_training():
                     'trainer':  trainer.state_dict(),
                     'args':     args.state_dict(),
                 }
-                # --- Permanent per-epoch checkpoint ---
-                ep_path = misc.save_epoch_checkpoint(ckpt_state, args.local_out_dir_path, ep+1)
-                print(f'[saving ckpt] permanent epoch ckpt @ {ep_path}', flush=True, clean=True)
-                # --- ar-ckpt-last.pth (backwards compat) ---
+                # last (for auto_resume)
                 misc.atomic_save(ckpt_state, os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'))
-                # --- ar-ckpt-best.pth ---
+                print(f'[ckpt] last saved (ep{ep+1})', flush=True, clean=True)
+                # best (by val loss tail)
                 if best_updated:
                     shutil.copy(os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'),
                                 os.path.join(args.local_out_dir_path, 'ar-ckpt-best.pth'))
+                    print(f'[ckpt] best updated (vL_tail={val_loss_tail:.4f})', flush=True, clean=True)
             dist.barrier()
         
         print(    f'         [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
         tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
         tb_lg.update(head='AR_z_burnout', step=ep+1, rest_hours=round(sec / 60 / 60, 2))
+        # ---- wandb epoch logging ----
+        if wandb_run is not None:
+            wandb_log = {f'epoch/{k}': v for k, v in AR_ep_loss.items()}
+            wandb_log['epoch/epoch'] = ep + 1
+            wandb_log['epoch/hours'] = round(sec / 60 / 60, 2)
+            wandb_log['epoch/lr'] = args.cur_lr
+            if curriculum_dataset is not None:
+                wandb_log['epoch/new_data_ratio'] = curriculum_dataset.new_data_ratio
+            wandb_run.log(wandb_log, step=ep + 1)
         args.dump_log(); tb_lg.flush()
     
     total_time = f'{(time.time() - start_time) / 60 / 60:.1f}h'
     print('\n\n')
     print(f'  [*] [PT finished]  Total cost: {total_time},    Lm: {best_L_mean:.3f} ({L_mean}),    Lt: {best_L_tail:.3f} ({L_tail})')
     print('\n\n')
-    
+
     del stats
     del iters_train, ld_train
     time.sleep(3), gc.collect(), torch.cuda.empty_cache(), time.sleep(3)
@@ -415,10 +445,12 @@ def main_training():
     args.remain_time, args.finish_time = '-', time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - 60))
     print(f'final args:\n\n{str(args)}')
     args.dump_log(); tb_lg.flush(); tb_lg.close()
+    if wandb_run is not None:
+        wandb_run.finish()
     dist.barrier()
 
 
-def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer):
+def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer, wandb_run=None):
     # import heavy packages after Dataloader object creation
     # --- MODIFIED IMPORT ---
     from fine_tuner import StyleVARTrainer
@@ -493,6 +525,18 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         if args.tclip > 0:
             tb_lg.update(head='AR_opt_grad/grad', grad_norm=grad_norm)
             tb_lg.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
+
+        # ---- wandb iter logging (every optimizer step) ----
+        if wandb_run is not None and stepping:
+            wandb_run.log({
+                'train/loss_mean': me.meters['Lm'].avg if 'Lm' in me.meters else None,
+                'train/loss_tail': me.meters['Lt'].avg if 'Lt' in me.meters else None,
+                'train/acc_mean': me.meters['Accm'].avg if 'Accm' in me.meters else None,
+                'train/acc_tail': me.meters['Acct'].avg if 'Acct' in me.meters else None,
+                'train/grad_norm': grad_norm,
+                'train/lr': max_tlr,
+                'train/wd': max_twd,
+            }, step=g_it)
 
         # --- Rolling checkpoint every save_every iterations ---
         if args.save_every > 0 and (it + 1) % args.save_every == 0 and dist.is_local_master():
