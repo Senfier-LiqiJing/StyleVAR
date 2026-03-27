@@ -42,17 +42,17 @@ class Args(Tap):
     alng: float = 1e-5  # the multiplier of ada_lin.w[gamma channels]'s initialization
     # VAR optimization
     fp16: int = 0           # 1: using fp16, 2: bf16
-    tblr: float = 1e-4      # base lr
+    tblr: float = 5e-4      # base lr
     tlr: float = None       # lr = base lr * (bs / 256)
     twd: float = 0.05       # initial wd
     twde: float = 0         # final wd, =twde or twd
     tclip: float = 2.       # <=0 for not using grad clip
     ls: float = 0.0         # label smooth
     
-    bs: int = 1024           # global batch size
-    batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size() / 8) * 8
+    bs: int = 48              # global batch size (bs_per_gpu = bs / ac / world_size)
+    batch_size: int = 0     # [automatically set; don't specify this] batch size per GPU = round(args.bs / args.ac / dist.get_world_size())
     glb_batch_size: int = 0 # [automatically set; don't specify this] global batch size = args.batch_size * dist.get_world_size()
-    ac: int = 128             # gradient accumulation
+    ac: int = 4               # gradient accumulation
     
     ep: int = 11
     wp: float = 0

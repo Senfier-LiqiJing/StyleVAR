@@ -176,48 +176,78 @@ def extract_imagepulse_tars(tar_dir: str, extract_dir: str) -> str:
 
 class ImagePulseDataset(Dataset):
     """
-    Dataset for DiffSynth-Studio/ImagePulse-StyleTransfer (extracted tar.gz).
+    Dataset for ImagePulse-StyleTransfer.
 
-    Expected layout after extraction::
+    Supports two layouts:
+
+    **Layout A** — per-sample folders (from ``prepare_imagepulse.py``)::
 
         root_dir/
-        ├── <archive_id_1>/
-        │   ├── <sample>.json   (has image_1, image_2, image_4 fields)
-        │   ├── <image_1>.png   (content)
-        │   ├── <image_2>.png   (style reference)
-        │   ├── <image_4>.png   (target / final style-transferred result)
-        │   └── ...
-        └── <archive_id_2>/ ...
+        ├── 0000000/
+        │   ├── content.png
+        │   ├── style.png
+        │   ├── target.png
+        │   └── meta.json
+        └── ...
 
-    Returns (target_img, style_img, content_img) — same order as
-    ``StyleTransferDataset`` so both are interchangeable in the trainer.
+    **Layout B** — raw extracted tar.gz archives::
+
+        root_dir/
+        ├── <archive_id>/
+        │   ├── <sample>.json   (has image_1, image_2, image_4)
+        │   ├── <image_1>.png   (content)
+        │   └── ...
+
+    Optionally pass ``file_list`` (list of folder names) to restrict to a
+    train/val subset.  Returns ``(target_img, style_img, content_img)``.
     """
 
-    def __init__(self, root_dir: str, transform=None):
+    def __init__(self, root_dir: str, transform=None, file_list=None):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []  # list of (content_path, style_path, target_path)
-        self._index(root_dir)
+        self._index(root_dir, file_list)
         print(f"[ImagePulse] Indexed {len(self.samples)} triplets from {root_dir}")
 
     # ------------------------------------------------------------------ #
-    def _index(self, root_dir: str):
-        json_files = sorted(glob.glob(osp.join(root_dir, "**", "*.json"), recursive=True))
-        for jf in json_files:
-            try:
-                with open(jf, "r") as f:
-                    meta = json.load(f)
-            except Exception:
+    def _index(self, root_dir: str, file_list=None):
+        if file_list is not None:
+            # Only scan the listed subdirectories
+            dirs_to_scan = [osp.join(root_dir, d) for d in file_list
+                           if osp.isdir(osp.join(root_dir, d))]
+        else:
+            # Scan all immediate subdirectories
+            dirs_to_scan = sorted([
+                osp.join(root_dir, d) for d in os.listdir(root_dir)
+                if osp.isdir(osp.join(root_dir, d))
+            ])
+
+        for scan_dir in dirs_to_scan:
+            # Try Layout A: per-sample folder with content.png/style.png/target.png
+            c = osp.join(scan_dir, "content.png")
+            s = osp.join(scan_dir, "style.png")
+            t = osp.join(scan_dir, "target.png")
+            if osp.isfile(c) and osp.isfile(s) and osp.isfile(t):
+                self.samples.append((c, s, t))
                 continue
-            # Require the three image fields
-            if not all(k in meta for k in ("image_1", "image_2", "image_4")):
-                continue
-            base_dir = osp.dirname(jf)
-            content_path = osp.join(base_dir, meta["image_1"])
-            style_path   = osp.join(base_dir, meta["image_2"])
-            target_path  = osp.join(base_dir, meta["image_4"])
-            if osp.isfile(content_path) and osp.isfile(style_path) and osp.isfile(target_path):
-                self.samples.append((content_path, style_path, target_path))
+
+            # Try Layout B: JSON files with image_1/image_2/image_4 fields
+            json_files = sorted(glob.glob(osp.join(scan_dir, "**", "*.json"),
+                                          recursive=True))
+            for jf in json_files:
+                try:
+                    with open(jf, "r") as f:
+                        meta = json.load(f)
+                except Exception:
+                    continue
+                if not all(k in meta for k in ("image_1", "image_2", "image_4")):
+                    continue
+                base_dir = osp.dirname(jf)
+                content_path = osp.join(base_dir, meta["image_1"])
+                style_path   = osp.join(base_dir, meta["image_2"])
+                target_path  = osp.join(base_dir, meta["image_4"])
+                if osp.isfile(content_path) and osp.isfile(style_path) and osp.isfile(target_path):
+                    self.samples.append((content_path, style_path, target_path))
 
     # ------------------------------------------------------------------ #
     def __len__(self):
@@ -320,6 +350,16 @@ def build_curriculum_dataset(
 
     # ---- Old dataset (OmniStyle) ----
     old_train = old_val = None
+    # Auto-create target symlink if OmniStyle-150K subdir exists but target/ doesn't
+    if old_data_path and osp.isdir(old_data_path):
+        target_link = osp.join(old_data_path, "target")
+        if not osp.exists(target_link):
+            for candidate in ("OmniStyle-150K", "OmniStyle-150k"):
+                real = osp.join(old_data_path, candidate)
+                if osp.isdir(real):
+                    os.symlink(osp.abspath(real), target_link)
+                    print(f"[OmniStyle] Created symlink: target -> {candidate}")
+                    break
     old_has_data = (old_data_path
                     and (osp.isdir(osp.join(old_data_path, "target"))
                          or osp.islink(osp.join(old_data_path, "target"))))
@@ -356,23 +396,32 @@ def build_curriculum_dataset(
 
     new_has_data = (new_data_path and osp.isdir(new_data_path))
     if new_has_data:
-        # Prefer organised layout (content/style/target + file lists)
-        organised_target = osp.join(new_data_path, "target")
         train_fl = _read_file_list(osp.join(new_data_path, "train_files.txt"))
         val_fl = _read_file_list(osp.join(new_data_path, "val_files.txt"))
 
-        if osp.isdir(organised_target) and train_fl and val_fl:
-            # Use StyleTransferDataset with organised layout
-            new_train = StyleTransferDataset(root_dir=new_data_path,
-                                             transform=common_transform,
-                                             file_list=train_fl)
-            new_val = StyleTransferDataset(root_dir=new_data_path,
-                                           transform=common_transform,
-                                           file_list=val_fl)
+        if train_fl and val_fl:
+            # Check which layout: organised flat dirs or per-sample folders
+            organised_target = osp.join(new_data_path, "target")
+            if osp.isdir(organised_target):
+                # Organised layout (content/style/target flat dirs, && filenames)
+                new_train = StyleTransferDataset(root_dir=new_data_path,
+                                                 transform=common_transform,
+                                                 file_list=train_fl)
+                new_val = StyleTransferDataset(root_dir=new_data_path,
+                                               transform=common_transform,
+                                               file_list=val_fl)
+            else:
+                # Per-sample folder layout (from prepare_imagepulse.py)
+                new_train = ImagePulseDataset(root_dir=new_data_path,
+                                              transform=common_transform,
+                                              file_list=train_fl)
+                new_val = ImagePulseDataset(root_dir=new_data_path,
+                                            transform=common_transform,
+                                            file_list=val_fl)
             print(f"[Curriculum] ImagePulse train={len(new_train)}, "
                   f"val={len(new_val)}")
         else:
-            # Fallback: use ImagePulseDataset with raw extracted layout
+            # No file lists — scan everything and split
             full_new = ImagePulseDataset(root_dir=new_data_path, transform=None)
             if len(full_new) > 0:
                 n = len(full_new)
