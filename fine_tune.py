@@ -48,6 +48,7 @@ def build_everything(args: arg_util.Args):
                 project=args.wandb_project,
                 entity=args.wandb_entity or None,
                 name=args.exp_name,
+                id=args.wandb_run_id or None,
                 config={k: v for k, v in args.state_dict().items()
                         if not k.startswith('cur_') and k not in
                         {'device', 'remain_time', 'finish_time'}},
@@ -424,13 +425,15 @@ def main_training():
         tb_lg.update(head='AR_z_burnout', step=ep+1, rest_hours=round(sec / 60 / 60, 2))
         # ---- wandb epoch logging ----
         if wandb_run is not None:
+            # Use iters_train-based step to stay monotonic with iter-level logs
+            ep_step = (ep + 1) * iters_train
             wandb_log = {f'epoch/{k}': v for k, v in AR_ep_loss.items()}
             wandb_log['epoch/epoch'] = ep + 1
             wandb_log['epoch/hours'] = round(sec / 60 / 60, 2)
             wandb_log['epoch/lr'] = args.cur_lr
             if curriculum_dataset is not None:
                 wandb_log['epoch/new_data_ratio'] = curriculum_dataset.new_data_ratio
-            wandb_run.log(wandb_log, step=ep + 1)
+            wandb_run.log(wandb_log, step=ep_step)
         args.dump_log(); tb_lg.flush()
     
     total_time = f'{(time.time() - start_time) / 60 / 60:.1f}h'

@@ -29,6 +29,7 @@ class Args(Tap):
     exp_name: str = 'style_var'
     wandb_project: str = 'StyleVAR'    # wandb project name (empty to disable)
     wandb_entity: str = ''              # wandb entity/team (empty for default)
+    wandb_run_id: str = ''              # wandb run id (for resuming to same run)
     clean_ckpt_path: str = '/home/PML-Project/local_output/style_var_d20_clean_fp32.pth' # this path does not contain vqvae or trainer state
     vanilla_ckpt_path:str = "/home/PML-Project/checkpoints/var_d20.pth"
     
