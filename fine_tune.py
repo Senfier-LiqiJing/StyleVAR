@@ -421,7 +421,10 @@ def main_training():
                 }
                 # last (for auto_resume)
                 misc.atomic_save(ckpt_state, os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'))
-                print(f'[ckpt] last saved (ep{ep+1})', flush=True, clean=True)
+                # epoch checkpoint
+                ep_path = os.path.join(args.local_out_dir_path, f'ar-ckpt-ep{ep+1}.pth')
+                shutil.copy(os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'), ep_path)
+                print(f'[ckpt] last + ep{ep+1} saved', flush=True, clean=True)
                 # best (by val loss tail)
                 if best_updated:
                     shutil.copy(os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'),
