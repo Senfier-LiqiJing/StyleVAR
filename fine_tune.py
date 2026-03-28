@@ -147,6 +147,15 @@ def build_everything(args: arg_util.Args):
     # --- MODIFIED TYPE HINT ---
     var_wo_ddp: StyleVAR = args.compile_model(var_wo_ddp, args.tfast)
 
+    # Alpha nums from command line
+    if hasattr(args, 'alpha_nums') and args.alpha_nums:
+        alpha_tuple = tuple(float(x) for x in args.alpha_nums.replace('-', '_').split('_'))
+        assert len(alpha_tuple) == len(var_wo_ddp.alpha_nums), \
+            f"alpha_nums length {len(alpha_tuple)} != patch_nums length {len(var_wo_ddp.alpha_nums)}"
+        var_wo_ddp.alpha_nums = alpha_tuple
+        if dist.is_local_master():
+            print(f"[Config] Alpha nums: {var_wo_ddp.alpha_nums}")
+
     # Alpha jitter for blended cross-attention robustness
     if hasattr(args, 'alpha_jitter') and args.alpha_jitter > 0:
         var_wo_ddp.alpha_jitter = args.alpha_jitter

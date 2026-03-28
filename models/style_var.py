@@ -33,17 +33,17 @@ class StyleVAR(nn.Module):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
-        alpha_nums = (0.2,0.3,0.4,0.4,0.5,0.5,0.6,0.6,0.7,0.8) # 10 alpha numbers
+        alpha_nums = (0.3,0.4,0.5,0.5,0.5,0.5,0.5,0.4,0.3,0.2) # 10 alpha numbers: mid-high, ends-low (preserve detail at fine scales)
     ):
         super().__init__()
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
-        
+
         self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
-        
+
         self.patch_nums: Tuple[int] = patch_nums
         self.alpha_nums: Tuple[float] = alpha_nums
         self.alpha_jitter: float = 0.0   # set > 0 to enable alpha jitter during training
@@ -411,7 +411,7 @@ class VARHF(StyleVAR, PyTorchModelHubMixin):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
-        alpha_nums = (0.2,0.3,0.4,0.4,0.5,0.5,0.6,0.6,0.7,0.8) # 10 alpha numbers
+        alpha_nums = (0.3,0.4,0.5,0.5,0.5,0.5,0.5,0.4,0.3,0.2) # 10 alpha numbers
     ):
         vae_local = VQVAE(**vae_kwargs)
         super().__init__(
