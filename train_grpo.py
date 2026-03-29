@@ -549,12 +549,14 @@ def compute_rewards(
     lam_ssim: float,
 ) -> torch.Tensor:
     """Compute composite reward R_i for each generated image.
+    gen_images_01 layout: [g0_b0, g0_b1, ..., g0_bB, g1_b0, ..., g1_bB, ...]
     Returns (total_reward, r_content, r_style, r_tv, r_ssim), each (B*G,)."""
     BG = gen_images_01.shape[0]
+    B = BG // G
 
-    # Expand conditions to match (B*G, ...)
-    style_exp   = style_img_01.repeat_interleave(G, dim=0)
-    content_exp = content_img_01.repeat_interleave(G, dim=0)
+    # Expand conditions: repeat B-block G times to match gen layout
+    style_exp   = style_img_01.repeat(G, 1, 1, 1)      # (B*G, 3, H, W)
+    content_exp = content_img_01.repeat(G, 1, 1, 1)
 
     # Content reward: negative LPIPS (expects [-1,1])
     gen_pm1     = gen_images_01 * 2 - 1
@@ -576,13 +578,16 @@ def compute_rewards(
 
 
 def compute_group_advantages(rewards: torch.Tensor, G: int) -> torch.Tensor:
-    """Group-relative advantage: A_i = (R_i - mu) / (sigma + eps)."""
+    """Group-relative advantage: A_i = (R_i - mu) / (sigma + eps).
+    rewards layout: [g0_b0, ..., g0_bB, g1_b0, ..., g1_bB, ...] shape (B*G,)
+    Returns same layout (B*G,)."""
     B = rewards.shape[0] // G
-    R = rewards.view(B, G)
+    # Reshape to (G, B) then transpose to (B, G) for group-wise normalization
+    R = rewards.view(G, B).T                   # (B, G)
     mu    = R.mean(dim=1, keepdim=True)
     sigma = R.std(dim=1, keepdim=True)
-    A = (R - mu) / (sigma + 1e-4)
-    return A.view(B * G)
+    A = (R - mu) / (sigma + 1e-4)             # (B, G)
+    return A.T.contiguous().view(B * G)        # back to (G, B) -> flatten
 
 
 # ======================== Checkpoint helpers =================================
@@ -803,8 +808,8 @@ def main():
             # ==============================================================
             # STEP 4: REWARDS
             # ==============================================================
-            style_01   = style_dev.add(1).mul(0.5)
-            content_01 = content_dev.add(1).mul(0.5)
+            style_01   = (style_dev + 1) * 0.5    # [-1,1] -> [0,1], no in-place
+            content_01 = (content_dev + 1) * 0.5
 
             rewards, r_content, r_style, r_tv, r_ssim = compute_rewards(
                 gen_images_01, style_01, content_01, G=args.G,
@@ -847,7 +852,7 @@ def main():
                 ref_lp = ref_logprobs[g*B:(g+1)*B].detach()
                 adv    = advantages[g*B:(g+1)*B].detach()
 
-                log_ratio = (new_lp.float() - old_lp.float()).clamp(-5.0, 5.0)
+                log_ratio = new_lp.float() - old_lp.float()
                 ratio = torch.exp(log_ratio)
                 adv_exp = adv.unsqueeze(1).expand_as(ratio)
 
@@ -856,8 +861,7 @@ def main():
                                     1.0 + args.clip_eps) * adv_exp
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                per_token_kl = (new_lp.float() - ref_lp.float()).clamp(-5.0, 5.0)
-                kl_loss = args.kl_coef * per_token_kl.mean()
+                kl_loss = args.kl_coef * (new_lp.float() - ref_lp.float()).mean()
 
                 loss = (policy_loss + kl_loss) / args.G
                 loss.backward()
