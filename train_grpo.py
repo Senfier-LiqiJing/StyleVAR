@@ -586,7 +586,7 @@ def compute_group_advantages(rewards: torch.Tensor, G: int) -> torch.Tensor:
     R = rewards.view(G, B).T                   # (B, G)
     mu    = R.mean(dim=1, keepdim=True)
     sigma = R.std(dim=1, keepdim=True)
-    A = (R - mu) / (sigma + 1e-4)             # (B, G)
+    A = (R - mu) / (sigma.clamp(min=1e-2) + 1e-8)  # (B, G)
     return A.T.contiguous().view(B * G)        # back to (G, B) -> flatten
 
 
@@ -660,6 +660,12 @@ def main():
 
     # ---- 1. Build model ----
     model, vae, patch_nums = _build_model(args)
+
+    # Freeze VAE (CRITICAL: quant.py uses .transpose_() which crashes backward
+    # if embedding.weight.requires_grad is True)
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad_(False)
 
     if args.use_lora:
         # LoRA mode: inject adapters, ref policy = LoRA disabled
@@ -771,7 +777,7 @@ def main():
             # ==============================================================
             # STEP 2: OLD LOG-PROBS
             # ==============================================================
-            with torch.no_grad():
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 style_feat, content_feat = precompute_style_content_features(
                     vae, style_dev, content_dev)
                 old_logprobs_list = []
@@ -786,7 +792,7 @@ def main():
             # ==============================================================
             # STEP 3: REFERENCE LOG-PROBS
             # ==============================================================
-            with torch.no_grad():
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 if args.use_lora:
                     set_lora_enabled(model, False)
                     ref_fwd_model = model
@@ -835,7 +841,11 @@ def main():
             # ==============================================================
             # STEP 5: POLICY UPDATE
             # ==============================================================
-            model.train()
+            # NOTE: keep model.eval() — do NOT call model.train()!
+            # StyleVAR has BatchNorm in ResNet encoders. train() mode uses
+            # batch statistics which differ from eval()'s running statistics,
+            # causing old_lp != new_lp even before any gradient update.
+            # eval() mode is fine for gradient computation (only affects BN/Dropout).
             optimizer.zero_grad()
 
             total_policy_loss = 0.0
@@ -861,7 +871,9 @@ def main():
                                     1.0 + args.clip_eps) * adv_exp
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                kl_loss = args.kl_coef * (new_lp.float() - ref_lp.float()).mean()
+                # Non-negative KL estimator (Schulman): (ratio - 1) - log(ratio) >= 0
+                log_ratio_kl = new_lp.float() - ref_lp.float()
+                kl_loss = args.kl_coef * (torch.exp(log_ratio_kl) - 1 - log_ratio_kl).mean()
 
                 loss = (policy_loss + kl_loss) / args.G
                 loss.backward()
