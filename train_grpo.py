@@ -71,8 +71,8 @@ def parse_args():
     # training
     p.add_argument("--epochs",       type=int,   default=5)
     p.add_argument("--batch_size",   type=int,   default=6,     help="Condition pairs per step")
-    p.add_argument("--lr",           type=float, default=1e-6)
-    p.add_argument("--grad_clip",    type=float, default=1.0)
+    p.add_argument("--lr",           type=float, default=5e-6)
+    p.add_argument("--grad_clip",    type=float, default=10.0)
     p.add_argument("--save_every",   type=int,   default=200)
     p.add_argument("--log_every",    type=int,   default=1)
     # sampling
