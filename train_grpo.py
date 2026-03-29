@@ -62,7 +62,7 @@ def parse_args():
     p.add_argument("--out_dir",   type=str, default="./grpo_output")
     # GRPO
     p.add_argument("--G",            type=int,   default=8,     help="Group size (rollouts per prompt)")
-    p.add_argument("--kl_coef",      type=float, default=0.1,   help="KL penalty coefficient beta")
+    p.add_argument("--kl_coef",      type=float, default=0.01,  help="KL penalty coefficient beta")
     p.add_argument("--clip_eps",     type=float, default=0.2,   help="PPO-style clipping epsilon")
     # reward weights
     p.add_argument("--lam_content",  type=float, default=1.0,   help="Weight for LPIPS content reward")
