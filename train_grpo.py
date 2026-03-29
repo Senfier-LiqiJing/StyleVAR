@@ -516,7 +516,8 @@ def compute_rewards(
     lam_style: float,
     lam_tv: float,
 ) -> torch.Tensor:
-    """Compute composite reward R_i for each generated image.  Returns (B*G,)."""
+    """Compute composite reward R_i for each generated image.
+    Returns (total_reward, r_content, r_style, r_tv), each (B*G,)."""
     BG = gen_images_01.shape[0]
 
     # Expand conditions to match (B*G, ...)
@@ -534,7 +535,8 @@ def compute_rewards(
     # Quality reward: negative TV
     r_tv = tv_reward(gen_images_01)
 
-    return lam_content * r_content + lam_style * r_style + lam_tv * r_tv
+    total = lam_content * r_content + lam_style * r_style + lam_tv * r_tv
+    return total, r_content, r_style, r_tv
 
 
 def compute_group_advantages(rewards: torch.Tensor, G: int) -> torch.Tensor:
@@ -674,7 +676,9 @@ def main():
     print(f"[GRPO] Steps/epoch: {len(dataloader)}, total: {len(dataloader)*args.epochs}")
 
     # ---- 7. Training loop ----
-    best_reward = -float("inf")
+    best_reward_ema = -float("inf")
+    reward_ema = None
+    reward_ema_beta = 0.99
 
     for epoch in range(start_epoch, args.epochs):
         t_epoch = time.time()
@@ -732,7 +736,7 @@ def main():
             style_01   = style_dev.add(1).mul(0.5)
             content_01 = content_dev.add(1).mul(0.5)
 
-            rewards = compute_rewards(
+            rewards, r_content, r_style, r_tv = compute_rewards(
                 gen_images_01, style_01, content_01, G=args.G,
                 lpips_net=lpips_net, vgg_gram=vgg_gram, tv_reward=tv_reward,
                 lam_content=args.lam_content, lam_style=args.lam_style,
@@ -740,6 +744,14 @@ def main():
             )
             advantages = compute_group_advantages(rewards, args.G)
             rewards_mean = rewards.mean().item()
+            r_content_mean = r_content.mean().item()
+            r_style_mean = r_style.mean().item()
+            r_tv_mean = r_tv.mean().item()
+            # EMA of reward for stable best-model selection
+            if reward_ema is None:
+                reward_ema = rewards_mean
+            else:
+                reward_ema = reward_ema_beta * reward_ema + (1 - reward_ema_beta) * rewards_mean
 
             del gen_images_01, style_01, content_01
             torch.cuda.empty_cache()
@@ -816,23 +828,28 @@ def main():
                         "grpo/kl_loss": total_kl_loss,
                         "grpo/total_loss": total_policy_loss + total_kl_loss,
                         "grpo/reward_mean": rewards_mean,
+                        "grpo/reward_ema": reward_ema,
+                        "reward/content (neg LPIPS)": r_content_mean,
+                        "reward/style (neg Gram)": r_style_mean,
+                        "reward/tv (neg TV)": r_tv_mean,
                         "grpo/grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
                         "grpo/lr": optimizer.param_groups[0]["lr"],
                         "grpo/mem_gb": mem,
                     }, step=global_step)
 
-            # ---- Rolling checkpoint ----
+            # ---- Rolling checkpoint (5 slots) ----
             if global_step % args.save_every == 0:
+                roll_idx = (global_step // args.save_every) % 5
                 p = _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args,
-                                     f"step{global_step}")
-                print(f"[ckpt] {os.path.basename(p)}")
+                                     f"roll{roll_idx}")
+                print(f"[ckpt] {os.path.basename(p)} (step={global_step})")
                 # Also save as latest
                 _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, "latest")
-                # Best by reward
-                if rewards_mean > best_reward:
-                    best_reward = rewards_mean
+                # Best by EMA reward
+                if reward_ema > best_reward_ema:
+                    best_reward_ema = reward_ema
                     _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, "best")
-                    print(f"[ckpt] best updated (R_mean={rewards_mean:.4f})")
+                    print(f"[ckpt] best updated (R_ema={reward_ema:.4f})")
 
         # ---- Epoch end ----
         ep_time = time.time() - t_epoch
