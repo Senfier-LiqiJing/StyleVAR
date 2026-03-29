@@ -74,7 +74,7 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=1e-5)
     p.add_argument("--grad_clip",    type=float, default=1.0)
     p.add_argument("--save_every",   type=int,   default=200)
-    p.add_argument("--log_every",    type=int,   default=10)
+    p.add_argument("--log_every",    type=int,   default=1)
     # sampling
     p.add_argument("--temperature",  type=float, default=1.0)
     p.add_argument("--top_k",       type=int,   default=900)

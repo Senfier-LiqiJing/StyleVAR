@@ -13,13 +13,13 @@ OUTPUT_DIR="${SCRIPT_DIR}/grpo_output"
 
 mkdir -p "${OUTPUT_DIR}"
 
-nohup python "${SCRIPT_DIR}/train_grpo.py" \
+nohup python -u "${SCRIPT_DIR}/train_grpo.py" \
     --content_dir "${SCRIPT_DIR}/data/coco2017/images/train2017" \
     --style_dir "${SCRIPT_DIR}/data/wikiart" \
     --vae_ckpt "${SCRIPT_DIR}/ckpt/vae_ch160v4096z32.pth" \
     --sft_out_dir "${SCRIPT_DIR}/Output" \
     --out_dir "${OUTPUT_DIR}" \
-    --G 8 --batch_size 6 \
+    --G 4 --batch_size 12 \
     --lr 1e-5 \
     --epochs 5 \
     --save_every 200 \
