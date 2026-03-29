@@ -33,7 +33,7 @@ class StyleVAR(nn.Module):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
-        alpha_nums = (0.3,0.4,0.5,0.5,0.5,0.5,0.5,0.4,0.3,0.2) # 10 alpha numbers: mid-high, ends-low (preserve detail at fine scales)
+        alpha_nums = (0.2,0.3,0.4,0.4,0.5,0.5,0.6,0.6,0.7,0.8) # 10 alpha numbers
     ):
         super().__init__()
         # 0. hyperparameters

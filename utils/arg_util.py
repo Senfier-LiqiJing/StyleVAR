@@ -84,7 +84,7 @@ class Args(Tap):
     workers: int = 6        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
     
     # alpha blending (style/content balance per scale)
-    alpha_nums: str = '0.3_0.4_0.5_0.5_0.5_0.5_0.5_0.4_0.3_0.2'  # underscore-separated, one per scale
+    alpha_nums: str = '0.2_0.3_0.4_0.4_0.5_0.5_0.6_0.6_0.7_0.8'  # underscore-separated, one per scale
     alpha_jitter: float = 0.0       # >0 to jitter alpha during training (e.g. 0.15)
 
     # curriculum mixed fine-tuning (set new_data_path to enable)

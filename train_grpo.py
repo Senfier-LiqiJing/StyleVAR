@@ -50,15 +50,18 @@ from utils.data import normalize_01_into_pm1
 def parse_args():
     p = argparse.ArgumentParser("GRPO training for StyleVAR (LoRA)")
     # paths
-    p.add_argument("--content_dir", type=str, default="data/coco2017",
+    p.add_argument("--content_dir", type=str, default="data/coco2017/images/train2017",
                     help="Directory with content images (recursive search)")
     p.add_argument("--style_dir",   type=str, default="data/wikiart",
                     help="Directory with style images (recursive search)")
     p.add_argument("--vae_ckpt",  type=str, default="ckpt/vae_ch160v4096z32.pth")
-    p.add_argument("--var_ckpt",  type=str, default="ckpt/style_var_d20_11_20_21.pth")
-    p.add_argument("--out_dir",   type=str, default="./grpo_outputs")
+    p.add_argument("--var_ckpt",  type=str, default="",
+                    help="StyleVAR checkpoint (SFT result). Empty=use best/last from --sft_out_dir")
+    p.add_argument("--sft_out_dir", type=str, default="Output",
+                    help="SFT output dir to auto-find best/last checkpoint")
+    p.add_argument("--out_dir",   type=str, default="./grpo_output")
     # GRPO
-    p.add_argument("--G",            type=int,   default=4,     help="Group size (rollouts per prompt)")
+    p.add_argument("--G",            type=int,   default=8,     help="Group size (rollouts per prompt)")
     p.add_argument("--kl_coef",      type=float, default=0.04,  help="KL penalty coefficient beta")
     p.add_argument("--clip_eps",     type=float, default=0.2,   help="PPO-style clipping epsilon")
     # reward weights
@@ -67,8 +70,8 @@ def parse_args():
     p.add_argument("--lam_tv",       type=float, default=0.01,  help="Weight for TV quality reward")
     # training
     p.add_argument("--epochs",       type=int,   default=5)
-    p.add_argument("--batch_size",   type=int,   default=2,     help="Condition pairs per step")
-    p.add_argument("--lr",           type=float, default=1e-4)
+    p.add_argument("--batch_size",   type=int,   default=4,     help="Condition pairs per step")
+    p.add_argument("--lr",           type=float, default=5e-5)
     p.add_argument("--grad_clip",    type=float, default=1.0)
     p.add_argument("--save_every",   type=int,   default=200)
     p.add_argument("--log_every",    type=int,   default=10)
@@ -79,8 +82,14 @@ def parse_args():
     # model
     p.add_argument("--depth",       type=int,   default=20)
     # LoRA
-    p.add_argument("--lora_rank",   type=int,   default=16,    help="LoRA rank")
-    p.add_argument("--lora_alpha",  type=float, default=32.0,  help="LoRA alpha (scaling = alpha/rank)")
+    p.add_argument("--lora_rank",   type=int,   default=64,    help="LoRA rank")
+    p.add_argument("--lora_alpha",  type=float, default=128.0, help="LoRA alpha (scaling = alpha/rank)")
+    # resume & logging
+    p.add_argument("--resume",      type=str, default="",
+                    help="Path to GRPO checkpoint to resume from (empty=auto-find latest)")
+    p.add_argument("--wandb_project", type=str, default="StyleVAR")
+    p.add_argument("--wandb_run_id",  type=str, default="")
+    p.add_argument("--exp_name",      type=str, default="grpo_lora_v1")
     return p.parse_args()
 
 
@@ -133,12 +142,14 @@ class LoRALinear(nn.Module):
 
 
 def apply_lora(model: StyleVAR, rank: int, alpha: float) -> List[nn.Parameter]:
-    """Freeze entire model, then inject LoRA into every attention layer.
+    """Freeze entire model, then inject LoRA into attention + FFN layers.
 
     Target layers per block:
-      - mat_qkv_guide  (C -> 3C, bias=False)  — Q/K/V for guide stream
-      - mat_qkv_target (C -> 3C, bias=False)  — Q/K/V for target stream
-      - proj           (C -> C,  bias=True)   — output projection
+      - mat_qkv_guide  (C -> 3C)   — Q/K/V for guide stream
+      - mat_qkv_target (C -> 3C)   — Q/K/V for target stream
+      - proj           (C -> C)    — attention output projection
+      - fc1            (C -> 4C)   — FFN up projection
+      - fc2            (4C -> C)   — FFN down projection
 
     Returns the list of trainable LoRA parameters.
     """
@@ -148,15 +159,23 @@ def apply_lora(model: StyleVAR, rank: int, alpha: float) -> List[nn.Parameter]:
 
     lora_params: List[nn.Parameter] = []
     for block in model.blocks:
+        # Attention layers
         attn = block.attn
         for attr_name in ("mat_qkv_guide", "mat_qkv_target", "proj"):
             old_linear = getattr(attn, attr_name)
             new_module = LoRALinear(old_linear, rank, alpha)
             setattr(attn, attr_name, new_module)
             lora_params.extend([new_module.lora_A, new_module.lora_B])
+        # FFN layers
+        ffn = block.ffn
+        for attr_name in ("fc1", "fc2"):
+            old_linear = getattr(ffn, attr_name)
+            new_module = LoRALinear(old_linear, rank, alpha)
+            setattr(ffn, attr_name, new_module)
+            lora_params.extend([new_module.lora_A, new_module.lora_B])
 
     total = sum(p.numel() for p in lora_params)
-    print(f"[LoRA] Injected into {len(model.blocks)} blocks, "
+    print(f"[LoRA] Injected into {len(model.blocks)} blocks (attn+ffn), "
           f"{len(lora_params)} adapter tensors, {total:,} trainable params")
     return lora_params
 
@@ -164,9 +183,12 @@ def apply_lora(model: StyleVAR, rank: int, alpha: float) -> List[nn.Parameter]:
 def set_lora_enabled(model: StyleVAR, enabled: bool):
     """Toggle LoRA on/off.  Off = reference policy (base model only)."""
     for block in model.blocks:
-        attn = block.attn
         for attr_name in ("mat_qkv_guide", "mat_qkv_target", "proj"):
-            module = getattr(attn, attr_name)
+            module = getattr(block.attn, attr_name)
+            if isinstance(module, LoRALinear):
+                module._enabled = enabled
+        for attr_name in ("fc1", "fc2"):
+            module = getattr(block.ffn, attr_name)
             if isinstance(module, LoRALinear):
                 module._enabled = enabled
 
@@ -525,42 +547,121 @@ def compute_group_advantages(rewards: torch.Tensor, G: int) -> torch.Tensor:
     return A.view(B * G)
 
 
+# ======================== Checkpoint helpers =================================
+
+def _resolve_sft_checkpoint(args):
+    """Find the best SFT checkpoint to initialize from."""
+    if args.var_ckpt and os.path.exists(args.var_ckpt):
+        return args.var_ckpt
+    # Auto-search in sft_out_dir
+    for name in ("ar-ckpt-best.pth", "ar-ckpt-last.pth"):
+        p = os.path.join(args.sft_out_dir, name)
+        if os.path.exists(p):
+            return p
+    # Fallback to ckpt dir
+    p = os.path.join("ckpt", "style_var_d20_11_20_21.pth")
+    if os.path.exists(p):
+        return p
+    raise FileNotFoundError("No StyleVAR checkpoint found. Specify --var_ckpt")
+
+
+def _find_latest_grpo_ckpt(out_dir):
+    """Find the latest GRPO checkpoint in out_dir."""
+    ckpts = sorted(glob.glob(os.path.join(out_dir, "grpo_lora_*.pth")),
+                   key=os.path.getmtime)
+    return ckpts[-1] if ckpts else None
+
+
+def _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, suffix):
+    """Save GRPO checkpoint (LoRA weights + optimizer + scaler)."""
+    ckpt_path = os.path.join(args.out_dir, f"grpo_lora_{suffix}.pth")
+    lora_state = {k: v for k, v in model.state_dict().items() if "lora_" in k}
+    torch.save({
+        "step": global_step,
+        "epoch": epoch,
+        "batch_idx": -1,
+        "lora": lora_state,
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
+        "args": vars(args),
+    }, ckpt_path)
+    return ckpt_path
+
+
 # ======================== Main Training Loop ===============================
 
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    DEV0 = torch.device("cuda:0")
-    DEV1 = torch.device("cuda:1")
+    DEV = torch.device("cuda:0")
+
+    # ---- Resolve SFT checkpoint ----
+    args.var_ckpt = _resolve_sft_checkpoint(args)
 
     print("=" * 60)
     print("  GRPO Training for StyleVAR  (LoRA)")
-    print(f"  Model + VAE on {DEV0},  Rewards on {DEV1}")
-    print(f"  G={args.G}, kl_coef={args.kl_coef}, clip_eps={args.clip_eps}")
+    print(f"  Device: {DEV}")
+    print(f"  SFT ckpt: {args.var_ckpt}")
+    print(f"  G={args.G}, bs={args.batch_size}, lr={args.lr}")
     print(f"  LoRA rank={args.lora_rank}, alpha={args.lora_alpha}")
+    print(f"  kl_coef={args.kl_coef}, clip_eps={args.clip_eps}")
     print("=" * 60)
 
     # ---- 1. Build model with LoRA ----
     model, vae, lora_params, patch_nums = _build_model(args)
-    L = sum(pn ** 2 for pn in patch_nums)  # 343
 
-    # ---- 2. Reward models on cuda:1 ----
-    lpips_net = _load_lpips_alex(DEV1)
-    vgg_gram  = VGGGramStyleReward().to(DEV1)
-    tv_reward = TVReward().to(DEV1)
-    print("[GRPO] Reward models loaded on cuda:1")
+    # ---- 2. Reward models (same GPU) ----
+    lpips_net = _load_lpips_alex(DEV)
+    vgg_gram  = VGGGramStyleReward().to(DEV)
+    tv_reward = TVReward().to(DEV)
+    print(f"[GRPO] Reward models loaded on {DEV}")
 
-    # ---- 3. Optimizer (LoRA params only) ----
+    # ---- 3. Optimizer ----
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr,
                                    betas=(0.9, 0.95), weight_decay=0.01)
-    scaler = torch.cuda.amp.GradScaler()   # mixed precision
+    scaler = torch.cuda.amp.GradScaler()
 
-    # ---- 4. Dataset (unpaired content + style) ----
+    # ---- 4. Resume from GRPO checkpoint ----
+    start_epoch = 0
+    global_step = 0
+    resume_path = args.resume
+    if not resume_path:
+        resume_path = _find_latest_grpo_ckpt(args.out_dir)
+    if resume_path and os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location="cpu")
+        # Load LoRA weights
+        model_sd = model.state_dict()
+        model_sd.update(ckpt["lora"])
+        model.load_state_dict(model_sd)
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt.get("epoch", 0)
+        global_step = ckpt.get("step", 0)
+        print(f"[GRPO] Resumed from {resume_path} (epoch={start_epoch}, step={global_step})")
+    else:
+        print("[GRPO] Starting fresh (no GRPO checkpoint found)")
+
+    # ---- 5. wandb ----
+    wandb_run = None
+    try:
+        import wandb
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.exp_name,
+            id=args.wandb_run_id or None,
+            config=vars(args),
+            resume="allow",
+        )
+        print(f"[wandb] {wandb_run.url}")
+    except Exception as e:
+        print(f"[wandb] Failed: {e}, continuing without wandb")
+
+    # ---- 6. Dataset ----
     transform = transforms.Compose([
         transforms.Resize((256, 256), interpolation=InterpolationMode.LANCZOS),
         transforms.ToTensor(),
-        normalize_01_into_pm1,              # -> [-1, 1]
+        normalize_01_into_pm1,
     ])
     dataset = UnpairedStyleContentDataset(
         content_dir=args.content_dir, style_dir=args.style_dir,
@@ -570,46 +671,48 @@ def main():
         num_workers=4, pin_memory=True, drop_last=True,
     )
     print(f"[GRPO] Dataset: {len(dataset)} samples, bs={args.batch_size}")
+    print(f"[GRPO] Steps/epoch: {len(dataloader)}, total: {len(dataloader)*args.epochs}")
 
-    # ---- 5. Training loop ----
-    global_step = 0
-    for epoch in range(args.epochs):
+    # ---- 7. Training loop ----
+    best_reward = -float("inf")
+
+    for epoch in range(start_epoch, args.epochs):
         t_epoch = time.time()
         for batch_idx, (style_pm1, content_pm1) in enumerate(dataloader):
             t0 = time.time()
             B = style_pm1.shape[0]
 
-            style_dev0   = style_pm1.to(DEV0, non_blocking=True)
-            content_dev0 = content_pm1.to(DEV0, non_blocking=True)
+            style_dev   = style_pm1.to(DEV, non_blocking=True)
+            content_dev = content_pm1.to(DEV, non_blocking=True)
 
             # ==============================================================
-            # STEP 1: ROLLOUT — generate G variations per (content, style)
+            # STEP 1: ROLLOUT
             # ==============================================================
             model.eval()
-            set_lora_enabled(model, True)       # sample from current policy
+            set_lora_enabled(model, True)
             token_trajs, gen_images_01 = rollout_generate(
-                model, vae, style_dev0, content_dev0,
+                model, vae, style_dev, content_dev,
                 G=args.G, temperature=args.temperature,
                 top_k=args.top_k, top_p=args.top_p,
             )
 
             # ==============================================================
-            # STEP 2: OLD LOG-PROBS (current policy, no grad)
+            # STEP 2: OLD LOG-PROBS
             # ==============================================================
             with torch.no_grad():
                 style_feat, content_feat = precompute_style_content_features(
-                    vae, style_dev0, content_dev0)
+                    vae, style_dev, content_dev)
                 old_logprobs_list = []
                 for g in range(args.G):
                     lp = compute_logprobs_single(
                         model, vae, token_trajs[g],
-                        style_dev0, content_dev0,
+                        style_dev, content_dev,
                         style_feat, content_feat)
                     old_logprobs_list.append(lp)
-                old_logprobs = torch.cat(old_logprobs_list, dim=0)  # (B*G, L)
+                old_logprobs = torch.cat(old_logprobs_list, dim=0)
 
             # ==============================================================
-            # STEP 3: REFERENCE LOG-PROBS (base model = LoRA disabled)
+            # STEP 3: REFERENCE LOG-PROBS (LoRA disabled)
             # ==============================================================
             with torch.no_grad():
                 set_lora_enabled(model, False)
@@ -617,35 +720,32 @@ def main():
                 for g in range(args.G):
                     lp = compute_logprobs_single(
                         model, vae, token_trajs[g],
-                        style_dev0, content_dev0,
+                        style_dev, content_dev,
                         style_feat, content_feat)
                     ref_logprobs_list.append(lp)
-                ref_logprobs = torch.cat(ref_logprobs_list, dim=0)  # (B*G, L)
+                ref_logprobs = torch.cat(ref_logprobs_list, dim=0)
                 set_lora_enabled(model, True)
 
             # ==============================================================
-            # STEP 4: REWARDS on cuda:1
+            # STEP 4: REWARDS
             # ==============================================================
-            gen_dev1     = gen_images_01.to(DEV1)
-            style_01     = style_dev0.add(1).mul(0.5).to(DEV1)
-            content_01   = content_dev0.add(1).mul(0.5).to(DEV1)
+            style_01   = style_dev.add(1).mul(0.5)
+            content_01 = content_dev.add(1).mul(0.5)
 
             rewards = compute_rewards(
-                gen_dev1, style_01, content_01, G=args.G,
+                gen_images_01, style_01, content_01, G=args.G,
                 lpips_net=lpips_net, vgg_gram=vgg_gram, tv_reward=tv_reward,
                 lam_content=args.lam_content, lam_style=args.lam_style,
                 lam_tv=args.lam_tv,
-            ).to(DEV0)                                         # (B*G,)
-            advantages = compute_group_advantages(rewards, args.G)  # (B*G,)
-
+            )
+            advantages = compute_group_advantages(rewards, args.G)
             rewards_mean = rewards.mean().item()
 
-            # Free reward-side memory
-            del gen_dev1, style_01, content_01, gen_images_01
+            del gen_images_01, style_01, content_01
             torch.cuda.empty_cache()
 
             # ==============================================================
-            # STEP 5: POLICY UPDATE (gradient accumulation across G)
+            # STEP 5: POLICY UPDATE
             # ==============================================================
             model.train()
             optimizer.zero_grad()
@@ -654,18 +754,16 @@ def main():
             total_kl_loss = 0.0
 
             for g in range(args.G):
-                # Forward with gradient (mixed precision)
                 with torch.cuda.amp.autocast():
                     new_lp = compute_logprobs_single(
                         model, vae, token_trajs[g],
-                        style_dev0, content_dev0,
-                        style_feat, content_feat)          # (B, L)
+                        style_dev, content_dev,
+                        style_feat, content_feat)
 
-                old_lp  = old_logprobs[g*B:(g+1)*B].detach()   # (B, L)
-                ref_lp  = ref_logprobs[g*B:(g+1)*B].detach()   # (B, L)
-                adv     = advantages[g*B:(g+1)*B].detach()      # (B,)
+                old_lp = old_logprobs[g*B:(g+1)*B].detach()
+                ref_lp = ref_logprobs[g*B:(g+1)*B].detach()
+                adv    = advantages[g*B:(g+1)*B].detach()
 
-                # Per-token ratio & clipped surrogate
                 log_ratio = new_lp.float() - old_lp.float()
                 ratio = torch.exp(log_ratio)
                 adv_exp = adv.unsqueeze(1).expand_as(ratio)
@@ -675,16 +773,14 @@ def main():
                                     1.0 + args.clip_eps) * adv_exp
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # KL penalty
                 kl_loss = args.kl_coef * (new_lp.float() - ref_lp.float()).mean()
 
-                loss = (policy_loss + kl_loss) / args.G   # average over G
+                loss = (policy_loss + kl_loss) / args.G
                 scaler.scale(loss).backward()
 
                 total_policy_loss += policy_loss.item() / args.G
                 total_kl_loss     += kl_loss.item() / args.G
 
-            # Gradient clipping & step
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 lora_params, max_norm=args.grad_clip)
@@ -702,8 +798,7 @@ def main():
 
             # ---- Logging ----
             if global_step % args.log_every == 0:
-                mem0 = torch.cuda.max_memory_allocated(DEV0) / 1e9
-                mem1 = torch.cuda.max_memory_allocated(DEV1) / 1e9
+                mem = torch.cuda.max_memory_allocated(DEV) / 1e9
                 print(
                     f"[Ep {epoch+1}/{args.epochs}] "
                     f"Step {global_step:5d} | "
@@ -712,39 +807,46 @@ def main():
                     f"kl={total_kl_loss:.4f} | "
                     f"R_mean={rewards_mean:.4f} | "
                     f"grad={grad_norm:.3f} | "
-                    f"mem0={mem0:.1f}G mem1={mem1:.1f}G | "
+                    f"mem={mem:.1f}G | "
                     f"{dt:.1f}s/step"
                 )
+                if wandb_run is not None:
+                    wandb_run.log({
+                        "grpo/policy_loss": total_policy_loss,
+                        "grpo/kl_loss": total_kl_loss,
+                        "grpo/total_loss": total_policy_loss + total_kl_loss,
+                        "grpo/reward_mean": rewards_mean,
+                        "grpo/grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
+                        "grpo/lr": optimizer.param_groups[0]["lr"],
+                        "grpo/mem_gb": mem,
+                    }, step=global_step)
 
-            # ---- Checkpoint (LoRA weights only) ----
+            # ---- Rolling checkpoint ----
             if global_step % args.save_every == 0:
-                ckpt_path = os.path.join(
-                    args.out_dir, f"grpo_lora_step{global_step}.pth")
-                lora_state = {k: v for k, v in model.state_dict().items()
-                              if "lora_" in k}
-                torch.save({
-                    "step": global_step,
-                    "epoch": epoch,
-                    "lora": lora_state,
-                    "optimizer": optimizer.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "args": vars(args),
-                }, ckpt_path)
-                print(f"[GRPO] Saved LoRA checkpoint: {ckpt_path}")
+                p = _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args,
+                                     f"step{global_step}")
+                print(f"[ckpt] {os.path.basename(p)}")
+                # Also save as latest
+                _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, "latest")
+                # Best by reward
+                if rewards_mean > best_reward:
+                    best_reward = rewards_mean
+                    _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, "best")
+                    print(f"[ckpt] best updated (R_mean={rewards_mean:.4f})")
 
-        print(f"[Ep {epoch+1}] finished in {time.time()-t_epoch:.0f}s")
+        # ---- Epoch end ----
+        ep_time = time.time() - t_epoch
+        print(f"[Ep {epoch+1}] finished in {ep_time/60:.1f}min")
+        _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch + 1, args,
+                         f"ep{epoch+1}")
+        _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch + 1, args, "latest")
 
-    # Final save
-    ckpt_path = os.path.join(args.out_dir, "grpo_lora_final.pth")
-    lora_state = {k: v for k, v in model.state_dict().items() if "lora_" in k}
-    torch.save({
-        "step": global_step,
-        "lora": lora_state,
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
-        "args": vars(args),
-    }, ckpt_path)
-    print(f"[GRPO] Final LoRA checkpoint saved: {ckpt_path}")
+    # ---- Final save ----
+    p = _save_grpo_ckpt(model, optimizer, scaler, global_step, args.epochs, args, "final")
+    print(f"[GRPO] Final checkpoint: {p}")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
