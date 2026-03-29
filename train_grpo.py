@@ -62,16 +62,17 @@ def parse_args():
     p.add_argument("--out_dir",   type=str, default="./grpo_output")
     # GRPO
     p.add_argument("--G",            type=int,   default=8,     help="Group size (rollouts per prompt)")
-    p.add_argument("--kl_coef",      type=float, default=0.04,  help="KL penalty coefficient beta")
+    p.add_argument("--kl_coef",      type=float, default=0.1,   help="KL penalty coefficient beta")
     p.add_argument("--clip_eps",     type=float, default=0.2,   help="PPO-style clipping epsilon")
     # reward weights
     p.add_argument("--lam_content",  type=float, default=1.0,   help="Weight for LPIPS content reward")
     p.add_argument("--lam_style",    type=float, default=1.0,   help="Weight for VGG Gram style reward")
     p.add_argument("--lam_tv",       type=float, default=0.01,  help="Weight for TV quality reward")
+    p.add_argument("--lam_ssim",     type=float, default=0.5,   help="Weight for SSIM structure reward")
     # training
     p.add_argument("--epochs",       type=int,   default=5)
     p.add_argument("--batch_size",   type=int,   default=6,     help="Condition pairs per step")
-    p.add_argument("--lr",           type=float, default=5e-6)
+    p.add_argument("--lr",           type=float, default=2e-6)
     p.add_argument("--grad_clip",    type=float, default=10.0)
     p.add_argument("--save_every",   type=int,   default=200)
     p.add_argument("--log_every",    type=int,   default=1)
@@ -283,6 +284,37 @@ class TVReward(nn.Module):
         dh = (img_01[:, :, 1:, :] - img_01[:, :, :-1, :]).abs().mean(dim=(1, 2, 3))
         dw = (img_01[:, :, :, 1:] - img_01[:, :, :, :-1]).abs().mean(dim=(1, 2, 3))
         return -(dh + dw)
+
+
+class SSIMReward(nn.Module):
+    """SSIM reward (pure tensor math, no learned params).
+    Measures structural similarity between generated and content images.
+    Returns per-sample SSIM in [0, 1], higher = better structure preservation.
+    """
+    def __init__(self, window_size: int = 11, C1: float = 0.01**2, C2: float = 0.03**2):
+        super().__init__()
+        self.C1, self.C2 = C1, C2
+        # Gaussian window
+        coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+        g = torch.exp(-(coords ** 2) / (2 * 1.5 ** 2))
+        g = g / g.sum()
+        window = g.unsqueeze(1) * g.unsqueeze(0)  # 2D
+        window = window.expand(3, 1, window_size, window_size).contiguous()
+        self.register_buffer("window", window)
+        self.pad = window_size // 2
+
+    @torch.no_grad()
+    def forward(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
+        """img1, img2: (B, 3, H, W) in [0, 1]. Returns (B,) SSIM scores."""
+        mu1 = F.conv2d(img1, self.window, padding=self.pad, groups=3)
+        mu2 = F.conv2d(img2, self.window, padding=self.pad, groups=3)
+        mu1_sq, mu2_sq, mu12 = mu1 * mu1, mu2 * mu2, mu1 * mu2
+        sigma1_sq = F.conv2d(img1 * img1, self.window, padding=self.pad, groups=3) - mu1_sq
+        sigma2_sq = F.conv2d(img2 * img2, self.window, padding=self.pad, groups=3) - mu2_sq
+        sigma12   = F.conv2d(img1 * img2, self.window, padding=self.pad, groups=3) - mu12
+        ssim_map = ((2*mu12 + self.C1) * (2*sigma12 + self.C2)) / \
+                   ((mu1_sq + mu2_sq + self.C1) * (sigma1_sq + sigma2_sq + self.C2))
+        return ssim_map.mean(dim=(1, 2, 3))  # (B,)
 
 
 def _load_lpips_alex(device: torch.device):
@@ -510,12 +542,14 @@ def compute_rewards(
     lpips_net: nn.Module,
     vgg_gram: VGGGramStyleReward,
     tv_reward: TVReward,
+    ssim_reward: SSIMReward,
     lam_content: float,
     lam_style: float,
     lam_tv: float,
+    lam_ssim: float,
 ) -> torch.Tensor:
     """Compute composite reward R_i for each generated image.
-    Returns (total_reward, r_content, r_style, r_tv), each (B*G,)."""
+    Returns (total_reward, r_content, r_style, r_tv, r_ssim), each (B*G,)."""
     BG = gen_images_01.shape[0]
 
     # Expand conditions to match (B*G, ...)
@@ -533,8 +567,12 @@ def compute_rewards(
     # Quality reward: negative TV
     r_tv = tv_reward(gen_images_01)
 
-    total = lam_content * r_content + lam_style * r_style + lam_tv * r_tv
-    return total, r_content, r_style, r_tv
+    # Structure reward: SSIM (generated vs content, already in [0,1])
+    r_ssim = ssim_reward(gen_images_01, content_exp)
+
+    total = (lam_content * r_content + lam_style * r_style +
+             lam_tv * r_tv + lam_ssim * r_ssim)
+    return total, r_content, r_style, r_tv, r_ssim
 
 
 def compute_group_advantages(rewards: torch.Tensor, G: int) -> torch.Tensor:
@@ -639,6 +677,7 @@ def main():
     lpips_net = _load_lpips_alex(DEV)
     vgg_gram  = VGGGramStyleReward().to(DEV)
     tv_reward_fn = TVReward().to(DEV)
+    ssim_reward_fn = SSIMReward().to(DEV)
     print(f"[GRPO] Reward models loaded on {DEV}")
 
     # ---- 3. Optimizer ----
@@ -767,17 +806,19 @@ def main():
             style_01   = style_dev.add(1).mul(0.5)
             content_01 = content_dev.add(1).mul(0.5)
 
-            rewards, r_content, r_style, r_tv = compute_rewards(
+            rewards, r_content, r_style, r_tv, r_ssim = compute_rewards(
                 gen_images_01, style_01, content_01, G=args.G,
                 lpips_net=lpips_net, vgg_gram=vgg_gram, tv_reward=tv_reward_fn,
+                ssim_reward=ssim_reward_fn,
                 lam_content=args.lam_content, lam_style=args.lam_style,
-                lam_tv=args.lam_tv,
+                lam_tv=args.lam_tv, lam_ssim=args.lam_ssim,
             )
             advantages = compute_group_advantages(rewards, args.G)
             rewards_mean = rewards.mean().item()
             r_content_mean = r_content.mean().item()
             r_style_mean = r_style.mean().item()
             r_tv_mean = r_tv.mean().item()
+            r_ssim_mean = r_ssim.mean().item()
             if reward_ema is None:
                 reward_ema = rewards_mean
             else:
@@ -815,7 +856,8 @@ def main():
                                     1.0 + args.clip_eps) * adv_exp
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                kl_loss = args.kl_coef * (new_lp.float() - ref_lp.float()).mean()
+                per_token_kl = (new_lp.float() - ref_lp.float()).clamp(-5.0, 5.0)
+                kl_loss = args.kl_coef * per_token_kl.mean()
 
                 loss = (policy_loss + kl_loss) / args.G
                 loss.backward()
@@ -846,7 +888,7 @@ def main():
                     f"policy={total_policy_loss:.4f} "
                     f"kl={total_kl_loss:.4f} | "
                     f"R={rewards_mean:.4f} R_ema={reward_ema:.4f} "
-                    f"[c={r_content_mean:.4f} s={r_style_mean:.4f} tv={r_tv_mean:.4f}] | "
+                    f"[c={r_content_mean:.4f} s={r_style_mean:.4f} ssim={r_ssim_mean:.4f} tv={r_tv_mean:.4f}] | "
                     f"grad={grad_norm:.3f} | "
                     f"mem={mem:.1f}G | "
                     f"{dt:.1f}s/step"
@@ -860,6 +902,7 @@ def main():
                         "grpo/reward_ema": reward_ema,
                         "reward/content (neg LPIPS)": r_content_mean,
                         "reward/style (neg Gram)": r_style_mean,
+                        "reward/ssim (structure)": r_ssim_mean,
                         "reward/tv (neg TV)": r_tv_mean,
                         "grpo/grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
                         "grpo/lr": optimizer.param_groups[0]["lr"],
