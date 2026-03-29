@@ -71,7 +71,7 @@ def parse_args():
     # training
     p.add_argument("--epochs",       type=int,   default=5)
     p.add_argument("--batch_size",   type=int,   default=6,     help="Condition pairs per step")
-    p.add_argument("--lr",           type=float, default=1e-5)
+    p.add_argument("--lr",           type=float, default=1e-6)
     p.add_argument("--grad_clip",    type=float, default=1.0)
     p.add_argument("--save_every",   type=int,   default=200)
     p.add_argument("--log_every",    type=int,   default=1)
@@ -806,7 +806,7 @@ def main():
                 ref_lp = ref_logprobs[g*B:(g+1)*B].detach()
                 adv    = advantages[g*B:(g+1)*B].detach()
 
-                log_ratio = new_lp.float() - old_lp.float()
+                log_ratio = (new_lp.float() - old_lp.float()).clamp(-5.0, 5.0)
                 ratio = torch.exp(log_ratio)
                 adv_exp = adv.unsqueeze(1).expand_as(ratio)
 
