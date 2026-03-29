@@ -1,10 +1,10 @@
 #!/bin/bash
-# StyleVAR GRPO (LoRA) training
-# Single 48GB GPU, rank=64, G=8, bs=4
+# StyleVAR GRPO training (full-param, single 49GB GPU)
 #
 # Usage:
-#   bash run_grpo.sh                    # default settings (nohup background)
-#   bash run_grpo.sh --epochs 10        # override any arg
+#   bash run_grpo.sh                         # full-param (default)
+#   bash run_grpo.sh --use_lora              # LoRA mode
+#   bash run_grpo.sh --epochs 10             # override any arg
 #   CUDA_VISIBLE_DEVICES=1 bash run_grpo.sh  # select GPU
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -19,12 +19,11 @@ nohup python "${SCRIPT_DIR}/train_grpo.py" \
     --vae_ckpt "${SCRIPT_DIR}/ckpt/vae_ch160v4096z32.pth" \
     --sft_out_dir "${SCRIPT_DIR}/Output" \
     --out_dir "${OUTPUT_DIR}" \
-    --lora_rank 64 --lora_alpha 128 \
-    --G 8 --batch_size 4 \
-    --lr 5e-5 \
+    --G 8 --batch_size 6 \
+    --lr 1e-5 \
     --epochs 5 \
     --save_every 200 \
-    --exp_name grpo_lora_v1 \
+    --exp_name grpo_fullparam_v1 \
     "$@" \
     > "${LOG_FILE}" 2>&1 &
 

@@ -48,7 +48,7 @@ from utils.data import normalize_01_into_pm1
 
 # ============================= CLI =========================================
 def parse_args():
-    p = argparse.ArgumentParser("GRPO training for StyleVAR (LoRA)")
+    p = argparse.ArgumentParser("GRPO training for StyleVAR")
     # paths
     p.add_argument("--content_dir", type=str, default="data/coco2017/images/train2017",
                     help="Directory with content images (recursive search)")
@@ -70,8 +70,8 @@ def parse_args():
     p.add_argument("--lam_tv",       type=float, default=0.01,  help="Weight for TV quality reward")
     # training
     p.add_argument("--epochs",       type=int,   default=5)
-    p.add_argument("--batch_size",   type=int,   default=4,     help="Condition pairs per step")
-    p.add_argument("--lr",           type=float, default=5e-5)
+    p.add_argument("--batch_size",   type=int,   default=6,     help="Condition pairs per step")
+    p.add_argument("--lr",           type=float, default=1e-5)
     p.add_argument("--grad_clip",    type=float, default=1.0)
     p.add_argument("--save_every",   type=int,   default=200)
     p.add_argument("--log_every",    type=int,   default=10)
@@ -81,15 +81,16 @@ def parse_args():
     p.add_argument("--top_p",       type=float, default=0.96)
     # model
     p.add_argument("--depth",       type=int,   default=20)
-    # LoRA
-    p.add_argument("--lora_rank",   type=int,   default=64,    help="LoRA rank")
-    p.add_argument("--lora_alpha",  type=float, default=128.0, help="LoRA alpha (scaling = alpha/rank)")
+    # training mode: full-param (default) or LoRA
+    p.add_argument("--use_lora",    action="store_true", help="Use LoRA instead of full-param")
+    p.add_argument("--lora_rank",   type=int,   default=256,   help="LoRA rank (only if --use_lora)")
+    p.add_argument("--lora_alpha",  type=float, default=512.0, help="LoRA alpha (only if --use_lora)")
     # resume & logging
     p.add_argument("--resume",      type=str, default="",
                     help="Path to GRPO checkpoint to resume from (empty=auto-find latest)")
     p.add_argument("--wandb_project", type=str, default="StyleVAR")
     p.add_argument("--wandb_run_id",  type=str, default="")
-    p.add_argument("--exp_name",      type=str, default="grpo_lora_v1")
+    p.add_argument("--exp_name",      type=str, default="grpo_fullparam_v1")
     return p.parse_args()
 
 
@@ -298,8 +299,8 @@ def _load_lpips_alex(device: torch.device):
 
 def _build_model(args):
     """
-    Build a SINGLE StyleVAR + VAE on cuda:0, apply LoRA.
-    No duplicate reference model needed (LoRA toggle serves as reference).
+    Build StyleVAR + VAE on cuda:0.
+    Does NOT inject LoRA or set trainability — that's done in main().
     """
     DEV = torch.device("cuda:0")
     patch_nums = tuple(int(x) for x in "1_2_3_4_5_6_8_10_13_16".split("_"))
@@ -313,12 +314,12 @@ def _build_model(args):
         style_enc_dim=512,
     )
 
-    # Load VAE weights (frozen via test_mode=True in VQVAE)
+    # Load VAE weights (frozen)
     vae_state = torch.load(args.vae_ckpt, map_location="cpu")
     vae.load_state_dict(vae_state, strict=True)
     print(f"[GRPO] VAE loaded from {args.vae_ckpt}")
 
-    # Load StyleVAR checkpoint
+    # Load StyleVAR checkpoint (SFT result)
     if args.var_ckpt and os.path.exists(args.var_ckpt):
         ckpt = torch.load(args.var_ckpt, map_location="cpu")
         if "trainer" in ckpt and "var_wo_ddp" in ckpt["trainer"]:
@@ -332,10 +333,7 @@ def _build_model(args):
     else:
         print("[GRPO] WARNING: No VAR checkpoint — training from scratch init")
 
-    # Inject LoRA (freezes base, returns trainable params)
-    lora_params = apply_lora(model, args.lora_rank, args.lora_alpha)
-
-    return model, vae, lora_params, patch_nums
+    return model, vae, patch_nums
 
 
 # ======================== Rollout (Autoregressive Sampling) ================
@@ -569,20 +567,23 @@ def _resolve_sft_checkpoint(args):
 
 def _find_latest_grpo_ckpt(out_dir):
     """Find the latest GRPO checkpoint in out_dir."""
-    ckpts = sorted(glob.glob(os.path.join(out_dir, "grpo_lora_*.pth")),
+    ckpts = sorted(glob.glob(os.path.join(out_dir, "grpo_*.pth")),
                    key=os.path.getmtime)
     return ckpts[-1] if ckpts else None
 
 
 def _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, suffix):
-    """Save GRPO checkpoint (LoRA weights + optimizer + scaler)."""
-    ckpt_path = os.path.join(args.out_dir, f"grpo_lora_{suffix}.pth")
-    lora_state = {k: v for k, v in model.state_dict().items() if "lora_" in k}
+    """Save GRPO checkpoint."""
+    ckpt_path = os.path.join(args.out_dir, f"grpo_{suffix}.pth")
+    if args.use_lora:
+        model_state = {k: v for k, v in model.state_dict().items() if "lora_" in k}
+    else:
+        model_state = model.state_dict()
     torch.save({
         "step": global_step,
         "epoch": epoch,
-        "batch_idx": -1,
-        "lora": lora_state,
+        "use_lora": args.use_lora,
+        "model": model_state,
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "args": vars(args),
@@ -593,6 +594,8 @@ def _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, suffix):
 # ======================== Main Training Loop ===============================
 
 def main():
+    import copy
+
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -601,30 +604,49 @@ def main():
     # ---- Resolve SFT checkpoint ----
     args.var_ckpt = _resolve_sft_checkpoint(args)
 
+    mode = "LoRA" if args.use_lora else "Full-param"
     print("=" * 60)
-    print("  GRPO Training for StyleVAR  (LoRA)")
+    print(f"  GRPO Training for StyleVAR  ({mode})")
     print(f"  Device: {DEV}")
     print(f"  SFT ckpt: {args.var_ckpt}")
     print(f"  G={args.G}, bs={args.batch_size}, lr={args.lr}")
-    print(f"  LoRA rank={args.lora_rank}, alpha={args.lora_alpha}")
+    if args.use_lora:
+        print(f"  LoRA rank={args.lora_rank}, alpha={args.lora_alpha}")
     print(f"  kl_coef={args.kl_coef}, clip_eps={args.clip_eps}")
     print("=" * 60)
 
-    # ---- 1. Build model with LoRA ----
-    model, vae, lora_params, patch_nums = _build_model(args)
+    # ---- 1. Build model ----
+    model, vae, patch_nums = _build_model(args)
 
-    # ---- 2. Reward models (same GPU) ----
+    if args.use_lora:
+        # LoRA mode: inject adapters, ref policy = LoRA disabled
+        lora_params = apply_lora(model, args.lora_rank, args.lora_alpha)
+        train_params = lora_params
+        ref_model = None  # use toggle
+    else:
+        # Full-param mode: all params trainable, deepcopy ref model
+        train_params = [p for p in model.parameters() if p.requires_grad]
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad_(False)
+        print(f"[GRPO] Ref model created (frozen copy, {sum(p.numel() for p in ref_model.parameters())/1e6:.0f}M params)")
+
+    total_train = sum(p.numel() for p in train_params)
+    print(f"[GRPO] Trainable params: {total_train:,} ({total_train/721e6*100:.1f}%)")
+
+    # ---- 2. Reward models ----
     lpips_net = _load_lpips_alex(DEV)
     vgg_gram  = VGGGramStyleReward().to(DEV)
-    tv_reward = TVReward().to(DEV)
+    tv_reward_fn = TVReward().to(DEV)
     print(f"[GRPO] Reward models loaded on {DEV}")
 
     # ---- 3. Optimizer ----
-    optimizer = torch.optim.AdamW(lora_params, lr=args.lr,
+    optimizer = torch.optim.AdamW(train_params, lr=args.lr,
                                    betas=(0.9, 0.95), weight_decay=0.01)
     scaler = torch.cuda.amp.GradScaler()
 
-    # ---- 4. Resume from GRPO checkpoint ----
+    # ---- 4. Resume ----
     start_epoch = 0
     global_step = 0
     resume_path = args.resume
@@ -632,9 +654,8 @@ def main():
         resume_path = _find_latest_grpo_ckpt(args.out_dir)
     if resume_path and os.path.exists(resume_path):
         ckpt = torch.load(resume_path, map_location="cpu")
-        # Load LoRA weights
         model_sd = model.state_dict()
-        model_sd.update(ckpt["lora"])
+        model_sd.update(ckpt["model"])
         model.load_state_dict(model_sd)
         optimizer.load_state_dict(ckpt["optimizer"])
         scaler.load_state_dict(ckpt["scaler"])
@@ -642,7 +663,7 @@ def main():
         global_step = ckpt.get("step", 0)
         print(f"[GRPO] Resumed from {resume_path} (epoch={start_epoch}, step={global_step})")
     else:
-        print("[GRPO] Starting fresh (no GRPO checkpoint found)")
+        print("[GRPO] Starting fresh")
 
     # ---- 5. wandb ----
     wandb_run = None
@@ -693,7 +714,8 @@ def main():
             # STEP 1: ROLLOUT
             # ==============================================================
             model.eval()
-            set_lora_enabled(model, True)
+            if args.use_lora:
+                set_lora_enabled(model, True)
             token_trajs, gen_images_01 = rollout_generate(
                 model, vae, style_dev, content_dev,
                 G=args.G, temperature=args.temperature,
@@ -716,19 +738,26 @@ def main():
                 old_logprobs = torch.cat(old_logprobs_list, dim=0)
 
             # ==============================================================
-            # STEP 3: REFERENCE LOG-PROBS (LoRA disabled)
+            # STEP 3: REFERENCE LOG-PROBS
             # ==============================================================
             with torch.no_grad():
-                set_lora_enabled(model, False)
+                if args.use_lora:
+                    set_lora_enabled(model, False)
+                    ref_fwd_model = model
+                else:
+                    ref_fwd_model = ref_model
+
                 ref_logprobs_list = []
                 for g in range(args.G):
                     lp = compute_logprobs_single(
-                        model, vae, token_trajs[g],
+                        ref_fwd_model, vae, token_trajs[g],
                         style_dev, content_dev,
                         style_feat, content_feat)
                     ref_logprobs_list.append(lp)
                 ref_logprobs = torch.cat(ref_logprobs_list, dim=0)
-                set_lora_enabled(model, True)
+
+                if args.use_lora:
+                    set_lora_enabled(model, True)
 
             # ==============================================================
             # STEP 4: REWARDS
@@ -738,7 +767,7 @@ def main():
 
             rewards, r_content, r_style, r_tv = compute_rewards(
                 gen_images_01, style_01, content_01, G=args.G,
-                lpips_net=lpips_net, vgg_gram=vgg_gram, tv_reward=tv_reward,
+                lpips_net=lpips_net, vgg_gram=vgg_gram, tv_reward=tv_reward_fn,
                 lam_content=args.lam_content, lam_style=args.lam_style,
                 lam_tv=args.lam_tv,
             )
@@ -747,7 +776,6 @@ def main():
             r_content_mean = r_content.mean().item()
             r_style_mean = r_style.mean().item()
             r_tv_mean = r_tv.mean().item()
-            # EMA of reward for stable best-model selection
             if reward_ema is None:
                 reward_ema = rewards_mean
             else:
@@ -795,7 +823,7 @@ def main():
 
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                lora_params, max_norm=args.grad_clip)
+                train_params, max_norm=args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
@@ -817,7 +845,8 @@ def main():
                     f"loss={total_policy_loss + total_kl_loss:.4f} "
                     f"policy={total_policy_loss:.4f} "
                     f"kl={total_kl_loss:.4f} | "
-                    f"R_mean={rewards_mean:.4f} | "
+                    f"R={rewards_mean:.4f} R_ema={reward_ema:.4f} "
+                    f"[c={r_content_mean:.4f} s={r_style_mean:.4f} tv={r_tv_mean:.4f}] | "
                     f"grad={grad_norm:.3f} | "
                     f"mem={mem:.1f}G | "
                     f"{dt:.1f}s/step"
@@ -843,9 +872,7 @@ def main():
                 p = _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args,
                                      f"roll{roll_idx}")
                 print(f"[ckpt] {os.path.basename(p)} (step={global_step})")
-                # Also save as latest
                 _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, "latest")
-                # Best by EMA reward
                 if reward_ema > best_reward_ema:
                     best_reward_ema = reward_ema
                     _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, "best")
