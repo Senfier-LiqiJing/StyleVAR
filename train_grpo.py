@@ -585,7 +585,7 @@ def _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, suffix):
         "use_lora": args.use_lora,
         "model": model_state,
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
+        "scaler": scaler.state_dict() if scaler else {},
         "args": vars(args),
     }, ckpt_path)
     return ckpt_path
@@ -644,7 +644,8 @@ def main():
     # ---- 3. Optimizer ----
     optimizer = torch.optim.AdamW(train_params, lr=args.lr,
                                    betas=(0.9, 0.95), weight_decay=0.01)
-    scaler = torch.cuda.amp.GradScaler()
+    # No GradScaler — use bf16 autocast only (scaler causes nan with log-prob ratios)
+    scaler = None
 
     # ---- 4. Resume ----
     start_epoch = 0
@@ -658,7 +659,8 @@ def main():
         model_sd.update(ckpt["model"])
         model.load_state_dict(model_sd)
         optimizer.load_state_dict(ckpt["optimizer"])
-        scaler.load_state_dict(ckpt["scaler"])
+        if scaler and "scaler" in ckpt and ckpt["scaler"]:
+            scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt.get("epoch", 0)
         global_step = ckpt.get("step", 0)
         print(f"[GRPO] Resumed from {resume_path} (epoch={start_epoch}, step={global_step})")
@@ -794,7 +796,7 @@ def main():
             total_kl_loss = 0.0
 
             for g in range(args.G):
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     new_lp = compute_logprobs_single(
                         model, vae, token_trajs[g],
                         style_dev, content_dev,
@@ -816,16 +818,14 @@ def main():
                 kl_loss = args.kl_coef * (new_lp.float() - ref_lp.float()).mean()
 
                 loss = (policy_loss + kl_loss) / args.G
-                scaler.scale(loss).backward()
+                loss.backward()
 
                 total_policy_loss += policy_loss.item() / args.G
                 total_kl_loss     += kl_loss.item() / args.G
 
-            scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 train_params, max_norm=args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             # ---- Cleanup ----
             del old_logprobs, ref_logprobs, advantages, rewards
