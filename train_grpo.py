@@ -851,11 +851,10 @@ def main():
             total_kl_loss = 0.0
 
             for g in range(args.G):
-                # No autocast — fp32 everywhere for numerical consistency
-                    new_lp = compute_logprobs_single(
-                        model, vae, token_trajs[g],
-                        style_dev, content_dev,
-                        style_feat, content_feat)
+                new_lp = compute_logprobs_single(
+                    model, vae, token_trajs[g],
+                    style_dev, content_dev,
+                    style_feat, content_feat)
 
                 old_lp = old_logprobs[g*B:(g+1)*B].detach()
                 ref_lp = ref_logprobs[g*B:(g+1)*B].detach()
