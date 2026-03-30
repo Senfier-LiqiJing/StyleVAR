@@ -694,8 +694,7 @@ def main():
     # ---- 3. Optimizer ----
     optimizer = torch.optim.AdamW(train_params, lr=args.lr,
                                    betas=(0.9, 0.95), weight_decay=0.01)
-    # No GradScaler — use bf16 autocast only (scaler causes nan with log-prob ratios)
-    scaler = None
+    scaler = None  # no mixed precision — full fp32 for numerical stability
 
     # ---- 4. Resume ----
     start_epoch = 0
@@ -777,7 +776,7 @@ def main():
             # ==============================================================
             # STEP 2: OLD LOG-PROBS
             # ==============================================================
-            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.no_grad():
                 style_feat, content_feat = precompute_style_content_features(
                     vae, style_dev, content_dev)
                 old_logprobs_list = []
@@ -792,7 +791,7 @@ def main():
             # ==============================================================
             # STEP 3: REFERENCE LOG-PROBS
             # ==============================================================
-            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.no_grad():
                 if args.use_lora:
                     set_lora_enabled(model, False)
                     ref_fwd_model = model
@@ -852,7 +851,7 @@ def main():
             total_kl_loss = 0.0
 
             for g in range(args.G):
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                # No autocast — fp32 everywhere for numerical consistency
                     new_lp = compute_logprobs_single(
                         model, vae, token_trajs[g],
                         style_dev, content_dev,
@@ -864,6 +863,13 @@ def main():
 
                 log_ratio = new_lp.float() - old_lp.float()
                 ratio = torch.exp(log_ratio)
+
+                # Debug: verify ratio ≈ 1.0 on first step (before any weight update)
+                if global_step == 0 and g == 0:
+                    print(f"  [DEBUG] ratio stats: mean={ratio.mean():.6f} std={ratio.std():.6f} "
+                          f"min={ratio.min():.6f} max={ratio.max():.6f}", flush=True)
+                    print(f"  [DEBUG] log_ratio stats: mean={log_ratio.mean():.6f} "
+                          f"abs_max={log_ratio.abs().max():.6f}", flush=True)
                 adv_exp = adv.unsqueeze(1).expand_as(ratio)
 
                 surr1 = ratio * adv_exp
@@ -876,10 +882,15 @@ def main():
                 kl_loss = args.kl_coef * (torch.exp(log_ratio_kl) - 1 - log_ratio_kl).mean()
 
                 loss = (policy_loss + kl_loss) / args.G
-                loss.backward()
 
-                total_policy_loss += policy_loss.item() / args.G
-                total_kl_loss     += kl_loss.item() / args.G
+                # Safety: skip if loss is NaN/Inf to prevent weight corruption
+                if torch.isfinite(loss):
+                    loss.backward()
+                    total_policy_loss += policy_loss.item() / args.G
+                    total_kl_loss     += kl_loss.item() / args.G
+                else:
+                    print(f"  [WARN] Skipping NaN/Inf loss at g={g}", flush=True)
+                    optimizer.zero_grad()  # discard any accumulated grads
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 train_params, max_norm=args.grad_clip)
