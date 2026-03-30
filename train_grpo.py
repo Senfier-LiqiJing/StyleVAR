@@ -62,7 +62,8 @@ def parse_args():
     p.add_argument("--out_dir",   type=str, default="./grpo_output")
     # GRPO
     p.add_argument("--G",            type=int,   default=8,     help="Group size (rollouts per prompt)")
-    p.add_argument("--kl_coef",      type=float, default=0.01,  help="KL penalty coefficient beta")
+    p.add_argument("--kl_coef",      type=float, default=0.01,  help="Initial KL penalty coefficient beta")
+    p.add_argument("--kl_target",    type=float, default=0.2,   help="Target per-step raw KL for adaptive coefficient (0=fixed)")
     p.add_argument("--clip_eps",     type=float, default=0.2,   help="PPO-style clipping epsilon")
     # reward weights
     p.add_argument("--lam_content",  type=float, default=1.0,   help="Weight for LPIPS content reward")
@@ -751,6 +752,7 @@ def main():
     best_reward_ema = -float("inf")
     reward_ema = None
     reward_ema_beta = 0.99
+    kl_coef = args.kl_coef  # adaptive: will be adjusted each step if kl_target > 0
 
     for epoch in range(start_epoch, args.epochs):
         t_epoch = time.time()
@@ -893,7 +895,7 @@ def main():
 
                 # Non-negative KL estimator (Schulman): (ratio - 1) - log(ratio) >= 0
                 log_ratio_kl = (new_lp.float() - ref_lp.float()).clamp(-10, 10)
-                kl_loss = args.kl_coef * (torch.exp(log_ratio_kl) - 1 - log_ratio_kl).mean()
+                kl_loss = kl_coef * (torch.exp(log_ratio_kl) - 1 - log_ratio_kl).mean()
 
                 loss = (policy_loss + kl_loss) / args.G
 
@@ -913,6 +915,15 @@ def main():
                 train_params, max_norm=args.grad_clip)
             optimizer.step()
 
+            # ---- Adaptive KL coefficient ----
+            # Only start adapting after 50 steps (KL is naturally small early on)
+            if args.kl_target > 0 and total_kl_loss > 0 and global_step >= 50:
+                raw_kl = total_kl_loss / kl_coef  # un-weighted KL
+                if raw_kl > 2.0 * args.kl_target:
+                    kl_coef = min(kl_coef * 1.5, 1.0)  # cap at 1.0
+                elif raw_kl < 0.5 * args.kl_target:
+                    kl_coef = max(kl_coef / 1.5, 1e-6)  # floor at 1e-6
+
             # ---- Cleanup ----
             del old_logprobs, ref_logprobs, advantages, rewards
             del style_feat, content_feat, token_trajs
@@ -930,7 +941,7 @@ def main():
                     f"Step {global_step:5d} | "
                     f"loss={total_policy_loss + total_kl_loss:.4f} "
                     f"policy={total_policy_loss:.4f} "
-                    f"kl={total_kl_loss:.4f} | "
+                    f"kl={total_kl_loss:.4f} kl_coef={kl_coef:.4f} | "
                     f"R={rewards_mean:.4f} R_ema={reward_ema:.4f} "
                     f"[c={r_content_mean:.4f} s={r_style_mean:.4f} ssim={r_ssim_mean:.4f} tv={r_tv_mean:.4f}] | "
                     f"grad={grad_norm:.3f} | "
@@ -949,6 +960,7 @@ def main():
                         "reward/ssim (structure)": r_ssim_mean,
                         "reward/tv (neg TV)": r_tv_mean,
                         "grpo/grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
+                        "grpo/kl_coef": kl_coef,
                         "grpo/lr": optimizer.param_groups[0]["lr"],
                         "grpo/mem_gb": mem,
                     }, step=global_step)
