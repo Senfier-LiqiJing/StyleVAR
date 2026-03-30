@@ -892,7 +892,7 @@ def main():
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Non-negative KL estimator (Schulman): (ratio - 1) - log(ratio) >= 0
-                log_ratio_kl = new_lp.float() - ref_lp.float()
+                log_ratio_kl = (new_lp.float() - ref_lp.float()).clamp(-10, 10)
                 kl_loss = args.kl_coef * (torch.exp(log_ratio_kl) - 1 - log_ratio_kl).mean()
 
                 loss = (policy_loss + kl_loss) / args.G
@@ -904,7 +904,10 @@ def main():
                     total_kl_loss     += kl_loss.item() / args.G
                 else:
                     print(f"  [WARN] Skipping NaN/Inf loss at g={g}", flush=True)
+                    del new_lp, log_ratio, ratio, adv_exp, surr1, surr2
+                    del log_ratio_kl, policy_loss, kl_loss, loss
                     optimizer.zero_grad()  # discard any accumulated grads
+                    torch.cuda.empty_cache()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 train_params, max_norm=args.grad_clip)
