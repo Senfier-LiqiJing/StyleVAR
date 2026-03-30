@@ -791,7 +791,8 @@ def main():
     best_reward_ema = -float("inf")
     reward_ema = None
     reward_ema_beta = 0.99
-    kl_coef = args.kl_coef  # adaptive: will be adjusted each step if kl_target > 0
+    kl_coef = args.kl_coef  # fixed coefficient
+    has_merged = False  # track if LoRA has been merged (changes save strategy)
 
     for epoch in range(start_epoch, args.epochs):
         t_epoch = time.time()
@@ -975,6 +976,7 @@ def main():
                 # Save full state AFTER merge (for resume — base_weight has changed)
                 _save_grpo_ckpt(model, optimizer, scaler, global_step + 1, epoch, args,
                                 "latest", full_state=True)
+                has_merged = True
                 print(f"  [REF UPDATE] Done. KL will reset to ~0.", flush=True)
 
             # ---- Cleanup ----
@@ -1022,23 +1024,27 @@ def main():
             if global_step % args.save_every == 0:
                 roll_idx = (global_step // args.save_every) % 5
                 p = _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args,
-                                     f"roll{roll_idx}")
+                                     f"roll{roll_idx}", full_state=has_merged)
                 print(f"[ckpt] {os.path.basename(p)} (step={global_step})")
-                _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, "latest")
+                _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args,
+                                "latest", full_state=has_merged)
                 if reward_ema > best_reward_ema:
                     best_reward_ema = reward_ema
-                    _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, "best")
+                    _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args,
+                                    "best", full_state=has_merged)
                     print(f"[ckpt] best updated (R_ema={reward_ema:.4f})")
 
         # ---- Epoch end ----
         ep_time = time.time() - t_epoch
         print(f"[Ep {epoch+1}] finished in {ep_time/60:.1f}min")
         _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch + 1, args,
-                         f"ep{epoch+1}")
-        _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch + 1, args, "latest")
+                         f"ep{epoch+1}", full_state=has_merged)
+        _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch + 1, args,
+                         "latest", full_state=has_merged)
 
     # ---- Final save ----
-    p = _save_grpo_ckpt(model, optimizer, scaler, global_step, args.epochs, args, "final")
+    p = _save_grpo_ckpt(model, optimizer, scaler, global_step, args.epochs, args,
+                         "final", full_state=has_merged)
     print(f"[GRPO] Final checkpoint: {p}")
 
     if wandb_run is not None:

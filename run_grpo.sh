@@ -23,7 +23,7 @@ nohup python -u "${SCRIPT_DIR}/train_grpo.py" \
     --lr 1e-5 --kl_coef 0.02 --kl_target 0 --grad_clip 1.0 --ref_update_every 200 \
     --epochs 10 \
     --save_every 200 \
-    --lam_content 1.0 --lam_style 1.0 --lam_ssim 1.0 --lam_tv 0.0 \
+    --lam_content 5.0 --lam_style 0.3 --lam_ssim 2.0 --lam_tv 0.0 \
     --exp_name grpo_lora_v1 \
     "$@" \
     > "${LOG_FILE}" 2>&1 &
