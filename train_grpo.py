@@ -920,9 +920,9 @@ def main():
             if args.kl_target > 0 and total_kl_loss > 0 and global_step >= 50:
                 raw_kl = total_kl_loss / kl_coef  # un-weighted KL
                 if raw_kl > 2.0 * args.kl_target:
-                    kl_coef = min(kl_coef * 1.5, 1.0)  # cap at 1.0
+                    kl_coef = min(kl_coef * 1.1, 0.5)   # gentle increase, cap at 0.5
                 elif raw_kl < 0.5 * args.kl_target:
-                    kl_coef = max(kl_coef / 1.5, 1e-6)  # floor at 1e-6
+                    kl_coef = max(kl_coef / 1.1, 1e-4)   # gentle decrease, floor at 1e-4
 
             # ---- Cleanup ----
             del old_logprobs, ref_logprobs, advantages, rewards
