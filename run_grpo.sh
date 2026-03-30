@@ -20,6 +20,7 @@ nohup python -u "${SCRIPT_DIR}/train_grpo.py" \
     --sft_out_dir "${SCRIPT_DIR}/Output" \
     --out_dir "${OUTPUT_DIR}" \
     --G 4 --batch_size 12 \
+    --lam_tv 0.0 \
     --lr 2e-6 \
     --epochs 5 \
     --save_every 200 \
