@@ -917,13 +917,11 @@ def main():
                 train_params, max_norm=args.grad_clip)
             optimizer.step()
 
-            # ---- Adaptive KL coefficient (upward only) ----
-            # Only increase kl_coef when KL drifts too high; never decrease.
-            # Decreasing caused kl_coef to collapse to 0.0009 in Run 15.
-            if args.kl_target > 0 and total_kl_loss > 0 and global_step >= 50:
-                raw_kl = total_kl_loss / kl_coef  # un-weighted KL
-                if raw_kl > 2.0 * args.kl_target:
-                    kl_coef = min(kl_coef * 1.1, 0.5)
+            # NOTE: kl_coef is fixed at args.kl_coef (0.02).
+            # Adaptive KL failed in all variants:
+            #   - Bidirectional: collapsed to 0.0009 (Run 15)
+            #   - Upward-only: ratcheted to 0.22, killed learning (Run 16)
+            # Fixed kl_coef + KL spike skip (>0.5) is sufficient.
 
             # ---- Cleanup ----
             del old_logprobs, ref_logprobs, advantages, rewards
