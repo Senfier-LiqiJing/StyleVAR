@@ -834,6 +834,13 @@ def main():
             else:
                 reward_ema = reward_ema_beta * reward_ema + (1 - reward_ema_beta) * rewards_mean
 
+            # Debug: reward/advantage diagnostics on first 3 steps
+            if global_step <= 2:
+                print(f"  [DEBUG step={global_step}] rewards: {rewards[:8].tolist()}", flush=True)
+                print(f"  [DEBUG step={global_step}] advantages: {advantages[:8].tolist()}", flush=True)
+                print(f"  [DEBUG step={global_step}] style_dev range: [{style_dev.min():.2f}, {style_dev.max():.2f}]", flush=True)
+                print(f"  [DEBUG step={global_step}] content_dev range: [{content_dev.min():.2f}, {content_dev.max():.2f}]", flush=True)
+
             del gen_images_01, style_01, content_01
             torch.cuda.empty_cache()
 
@@ -863,12 +870,20 @@ def main():
                 log_ratio = new_lp.float() - old_lp.float()
                 ratio = torch.exp(log_ratio)
 
-                # Debug: verify ratio ≈ 1.0 on first step (before any weight update)
-                if global_step == 0 and g == 0:
-                    print(f"  [DEBUG] ratio stats: mean={ratio.mean():.6f} std={ratio.std():.6f} "
+                # Debug: print diagnostics on first 3 steps
+                if global_step <= 2 and g == 0:
+                    print(f"  [DEBUG step={global_step} g={g}]", flush=True)
+                    print(f"    ratio: mean={ratio.mean():.6f} std={ratio.std():.6f} "
                           f"min={ratio.min():.6f} max={ratio.max():.6f}", flush=True)
-                    print(f"  [DEBUG] log_ratio stats: mean={log_ratio.mean():.6f} "
-                          f"abs_max={log_ratio.abs().max():.6f}", flush=True)
+                    print(f"    log_ratio: mean={log_ratio.mean():.6f} abs_max={log_ratio.abs().max():.6f}", flush=True)
+                    print(f"    new_lp: mean={new_lp.mean():.4f} std={new_lp.std():.4f}", flush=True)
+                    print(f"    old_lp: mean={old_lp.mean():.4f} std={old_lp.std():.4f}", flush=True)
+                    print(f"    ref_lp: mean={ref_lp.mean():.4f} std={ref_lp.std():.4f}", flush=True)
+                    print(f"    old==new match: {(new_lp - old_lp).abs().max():.8f}", flush=True)
+                    print(f"    old==ref match: {(old_lp - ref_lp).abs().max():.8f}", flush=True)
+                    print(f"    advantage: mean={adv.mean():.4f} std={adv.std():.4f} "
+                          f"min={adv.min():.4f} max={adv.max():.4f}", flush=True)
+                    print(f"    mem: {torch.cuda.memory_allocated()/1e9:.1f}GB", flush=True)
                 adv_exp = adv.unsqueeze(1).expand_as(ratio)
 
                 surr1 = ratio * adv_exp
