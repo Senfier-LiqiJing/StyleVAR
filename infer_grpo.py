@@ -130,9 +130,13 @@ def main():
 
     # ---- Load SFT base ----
     sft_path = os.path.join(ROOT, args.sft_ckpt)
-    sft_state = torch.load(sft_path, map_location="cpu")
-    if "model" in sft_state:
-        sft_state = sft_state["model"]
+    sft_ckpt = torch.load(sft_path, map_location="cpu")
+    if "trainer" in sft_ckpt and "var_wo_ddp" in sft_ckpt["trainer"]:
+        sft_state = sft_ckpt["trainer"]["var_wo_ddp"]
+    elif "model" in sft_ckpt:
+        sft_state = sft_ckpt["model"]
+    else:
+        sft_state = sft_ckpt
     model.load_state_dict(sft_state, strict=True)
     print(f"[SFT] Loaded from {sft_path}")
 
