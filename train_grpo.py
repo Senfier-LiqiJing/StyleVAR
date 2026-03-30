@@ -65,6 +65,8 @@ def parse_args():
     p.add_argument("--kl_coef",      type=float, default=0.01,  help="Initial KL penalty coefficient beta")
     p.add_argument("--kl_target",    type=float, default=0.2,   help="Target per-step raw KL for adaptive coefficient (0=fixed)")
     p.add_argument("--clip_eps",     type=float, default=0.2,   help="PPO-style clipping epsilon")
+    p.add_argument("--ref_update_every", type=int, default=0,
+                    help="Merge LoRA into base & reinit every N steps (0=never, i.e. fixed reference)")
     # reward weights
     p.add_argument("--lam_content",  type=float, default=1.0,   help="Weight for LPIPS content reward")
     p.add_argument("--lam_style",    type=float, default=1.0,   help="Weight for VGG Gram style reward")
@@ -194,6 +196,38 @@ def set_lora_enabled(model: StyleVAR, enabled: bool):
             module = getattr(block.ffn, attr_name)
             if isinstance(module, LoRALinear):
                 module._enabled = enabled
+
+
+def merge_lora_and_reinit(model: StyleVAR) -> List[nn.Parameter]:
+    """Merge LoRA weights into base, reinitialize LoRA to zero.
+
+    After this call:
+      - base_weight contains the old (base + LoRA) effective weight
+      - lora_A is re-initialized (kaiming), lora_B is zeroed
+      - set_lora_enabled(False) gives the NEW reference (= old policy)
+      - set_lora_enabled(True)  gives the NEW policy   (= old policy + fresh LoRA ≈ old policy)
+      - KL between policy and reference starts at ~0
+    Returns the new list of trainable LoRA parameters (for optimizer reset).
+    """
+    lora_params: List[nn.Parameter] = []
+    for block in model.blocks:
+        for attr_name in ("mat_qkv_guide", "mat_qkv_target", "proj"):
+            module = getattr(block.attn, attr_name)
+            if isinstance(module, LoRALinear):
+                with torch.no_grad():
+                    module.base_weight.add_((module.lora_B @ module.lora_A) * module.scaling)
+                    nn.init.kaiming_uniform_(module.lora_A, a=math.sqrt(5))
+                    module.lora_B.zero_()
+                lora_params.extend([module.lora_A, module.lora_B])
+        for attr_name in ("fc1", "fc2"):
+            module = getattr(block.ffn, attr_name)
+            if isinstance(module, LoRALinear):
+                with torch.no_grad():
+                    module.base_weight.add_((module.lora_B @ module.lora_A) * module.scaling)
+                    nn.init.kaiming_uniform_(module.lora_A, a=math.sqrt(5))
+                    module.lora_B.zero_()
+                lora_params.extend([module.lora_A, module.lora_B])
+    return lora_params
 
 
 # ======================== Dataset ==========================================
@@ -616,10 +650,15 @@ def _find_latest_grpo_ckpt(out_dir):
     return ckpts[-1] if ckpts else None
 
 
-def _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, suffix):
-    """Save GRPO checkpoint."""
+def _save_grpo_ckpt(model, optimizer, scaler, global_step, epoch, args, suffix,
+                    full_state=False):
+    """Save GRPO checkpoint.
+
+    full_state=True saves entire model (needed after merge_lora_and_reinit,
+    because base_weight has changed and LoRA-only keys are zeroed).
+    """
     ckpt_path = os.path.join(args.out_dir, f"grpo_{suffix}.pth")
-    if args.use_lora:
+    if args.use_lora and not full_state:
         model_state = {k: v for k, v in model.state_dict().items() if "lora_" in k}
     else:
         model_state = model.state_dict()
@@ -922,6 +961,21 @@ def main():
             #   - Bidirectional: collapsed to 0.0009 (Run 15)
             #   - Upward-only: ratcheted to 0.22, killed learning (Run 16)
             # Fixed kl_coef + KL spike skip (>0.5) is sufficient.
+
+            # ---- Periodic reference update (iterative GRPO) ----
+            if (args.ref_update_every > 0
+                    and (global_step + 1) % args.ref_update_every == 0):
+                print(f"  [REF UPDATE] Merging LoRA into base at step {global_step+1}", flush=True)
+                # Save full model state BEFORE merge (this is the best policy so far)
+                _save_grpo_ckpt(model, optimizer, scaler, global_step + 1, epoch, args,
+                                f"pre_merge_step{global_step+1}", full_state=True)
+                train_params = merge_lora_and_reinit(model)
+                optimizer = torch.optim.AdamW(train_params, lr=args.lr,
+                                               betas=(0.9, 0.95), weight_decay=0.01)
+                # Save full state AFTER merge (for resume — base_weight has changed)
+                _save_grpo_ckpt(model, optimizer, scaler, global_step + 1, epoch, args,
+                                "latest", full_state=True)
+                print(f"  [REF UPDATE] Done. KL will reset to ~0.", flush=True)
 
             # ---- Cleanup ----
             del old_logprobs, ref_logprobs, advantages, rewards

@@ -20,7 +20,7 @@ nohup python -u "${SCRIPT_DIR}/train_grpo.py" \
     --out_dir "${OUTPUT_DIR}" \
     --use_lora --lora_rank 256 --lora_alpha 512 \
     --G 4 --batch_size 12 \
-    --lr 1e-5 --kl_coef 0.02 --kl_target 0 --grad_clip 1.0 \
+    --lr 1e-5 --kl_coef 0.02 --kl_target 0 --grad_clip 1.0 --ref_update_every 200 \
     --epochs 10 \
     --save_every 200 \
     --lam_content 1.0 --lam_style 1.0 --lam_ssim 1.0 --lam_tv 0.0 \
