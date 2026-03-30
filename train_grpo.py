@@ -899,13 +899,15 @@ def main():
 
                 loss = (policy_loss + kl_loss) / args.G
 
-                # Safety: skip if loss is NaN/Inf to prevent weight corruption
-                if torch.isfinite(loss):
+                # Safety: skip if loss is NaN/Inf OR KL spike to prevent weight corruption
+                kl_spike = kl_loss.item() / args.G > 0.5  # raw KL > 0.5 per step = spike
+                if torch.isfinite(loss) and not kl_spike:
                     loss.backward()
                     total_policy_loss += policy_loss.item() / args.G
                     total_kl_loss     += kl_loss.item() / args.G
                 else:
-                    print(f"  [WARN] Skipping NaN/Inf loss at g={g}", flush=True)
+                    reason = "NaN/Inf" if not torch.isfinite(loss) else f"KL spike ({kl_loss.item()/args.G:.2f})"
+                    print(f"  [WARN] Skipping {reason} at g={g}", flush=True)
                     del new_lp, log_ratio, ratio, adv_exp, surr1, surr2
                     del log_ratio_kl, policy_loss, kl_loss, loss
                     optimizer.zero_grad()  # discard any accumulated grads
@@ -915,14 +917,13 @@ def main():
                 train_params, max_norm=args.grad_clip)
             optimizer.step()
 
-            # ---- Adaptive KL coefficient ----
-            # Only start adapting after 50 steps (KL is naturally small early on)
+            # ---- Adaptive KL coefficient (upward only) ----
+            # Only increase kl_coef when KL drifts too high; never decrease.
+            # Decreasing caused kl_coef to collapse to 0.0009 in Run 15.
             if args.kl_target > 0 and total_kl_loss > 0 and global_step >= 50:
                 raw_kl = total_kl_loss / kl_coef  # un-weighted KL
                 if raw_kl > 2.0 * args.kl_target:
-                    kl_coef = min(kl_coef * 1.1, 0.5)   # gentle increase, cap at 0.5
-                elif raw_kl < 0.5 * args.kl_target:
-                    kl_coef = max(kl_coef / 1.1, 1e-4)   # gentle decrease, floor at 1e-4
+                    kl_coef = min(kl_coef * 1.1, 0.5)
 
             # ---- Cleanup ----
             del old_logprobs, ref_logprobs, advantages, rewards
