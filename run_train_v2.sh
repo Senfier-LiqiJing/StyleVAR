@@ -24,7 +24,7 @@ nohup torchrun --nproc_per_node=1 "${SCRIPT_DIR}/fine_tune.py" \
     --ep 10 \
     --data_path "${SCRIPT_DIR}/data/OmniStyle-150k" \
     --new_data_path "${SCRIPT_DIR}/data/ImagePulse" \
-    --concat_datasets \
+    --concat_datasets True \
     --alpha_nums "0.1_0.2_0.25_0.3_0.3_0.35_0.4_0.4_0.5_0.5" \
     --alpha_jitter 0.15 \
     --clean_ckpt_path "${SCRIPT_DIR}/ckpt/var_d20.pth" \
