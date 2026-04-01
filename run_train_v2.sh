@@ -29,6 +29,7 @@ nohup torchrun --nproc_per_node=1 "${SCRIPT_DIR}/fine_tune.py" \
     --alpha_jitter 0.15 \
     --clean_ckpt_path "${SCRIPT_DIR}/ckpt/var_d20.pth" \
     --exp_name sft_v2_content_preserving \
+    --wandb_project StyleVAR \
     --save_every 200 \
     --local_out_dir_path "${OUTPUT_DIR}" \
     "$@" \
