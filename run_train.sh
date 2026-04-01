@@ -17,7 +17,7 @@ nohup torchrun --nproc_per_node=1 "${SCRIPT_DIR}/fine_tune.py" \
     --fp16 2 \
     --bs 48 --ac 4 \
     --tblr 5e-4 \
-    --ep 10 \
+    --ep 20 \
     --data_path "${SCRIPT_DIR}/data/OmniStyle-150k" \
     --new_data_path "${SCRIPT_DIR}/data/ImagePulse" \
     --curriculum_start 0.3 --curriculum_end 0.7 \

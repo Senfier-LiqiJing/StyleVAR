@@ -22,3 +22,13 @@ local_output*
 data
 flash_attn-2.8.0+cu121torch2.4-cp310-cp310-linux_x86_64.whl
 !quick_infer.ipynb
+grpo_output/
+Output/
+download_ckpt.sh
+extract_wikiart.py
+grpo_infer_results_comparison.png
+infer_results.png
+quick_infer.ipynb
+style_strength_sweep.png
+test_dependency.py
+wandb/

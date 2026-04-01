@@ -19,7 +19,7 @@ mkdir -p "${OUTPUT_DIR}"
 
 nohup torchrun --nproc_per_node=1 "${SCRIPT_DIR}/fine_tune.py" \
     --fp16 2 \
-    --bs 64 --ac 4 \
+    --bs 56 --ac 4 \
     --tblr 5e-4 \
     --ep 10 \
     --data_path "${SCRIPT_DIR}/data/OmniStyle-150k" \
