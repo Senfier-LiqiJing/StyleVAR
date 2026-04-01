@@ -30,6 +30,7 @@ nohup torchrun --nproc_per_node=1 "${SCRIPT_DIR}/fine_tune.py" \
     --clean_ckpt_path "${SCRIPT_DIR}/ckpt/var_d20.pth" \
     --exp_name sft_v2_content_preserving \
     --wandb_project StyleVAR \
+    --wandb_run_id nqe7u9uk \
     --save_every 1000 \
     --val_every 4000 \
     --local_out_dir_path "${OUTPUT_DIR}" \
