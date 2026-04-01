@@ -92,9 +92,11 @@ class Args(Tap):
     new_data_tar_dir: str = ''      # directory containing raw .tar.gz (auto-extracted if new_data_path missing)
     curriculum_start: float = 0.3   # initial ratio of new-dataset samples
     curriculum_end: float = 0.7     # final ratio of new-dataset samples
+    concat_datasets: bool = False   # True = one epoch sees ALL samples from both datasets
 
     # checkpointing
     save_every: int = 200           # save rolling checkpoint every N iterations (0 = disabled)
+    val_every: int = 0              # mid-epoch validation every N iters (0 = epoch-end only)
     max_rolling: int = 5            # number of rolling checkpoint slots
 
     # progressive training

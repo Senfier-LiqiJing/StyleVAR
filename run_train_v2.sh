@@ -24,13 +24,14 @@ nohup torchrun --nproc_per_node=1 "${SCRIPT_DIR}/fine_tune.py" \
     --ep 10 \
     --data_path "${SCRIPT_DIR}/data/OmniStyle-150k" \
     --new_data_path "${SCRIPT_DIR}/data/ImagePulse" \
-    --curriculum_start 0.3 --curriculum_end 0.7 \
+    --concat_datasets \
     --alpha_nums "0.1_0.2_0.25_0.3_0.3_0.35_0.4_0.4_0.5_0.5" \
     --alpha_jitter 0.15 \
     --clean_ckpt_path "${SCRIPT_DIR}/ckpt/var_d20.pth" \
     --exp_name sft_v2_content_preserving \
     --wandb_project StyleVAR \
-    --save_every 200 \
+    --save_every 1000 \
+    --val_every 4000 \
     --local_out_dir_path "${OUTPUT_DIR}" \
     "$@" \
     > "${LOG_FILE}" 2>&1 &

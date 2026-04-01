@@ -450,3 +450,121 @@ def build_curriculum_dataset(
 
     print(f"[Curriculum] Final  train_len={len(train_set)}, val_len={len(val_set)}")
     return 1000, train_set, val_set
+
+
+def build_concat_dataset(
+    old_data_path: str,
+    new_data_path: str,
+    new_data_tar_dir: str,
+    final_reso: int,
+    hflip=False, mid_reso=1.125,
+):
+    """
+    Build a concatenated dataset: one epoch = ALL OmniStyle + ALL ImagePulse samples.
+    Unlike CurriculumMixedDataset, every sample is seen exactly once per epoch.
+    """
+    # Reuse build_curriculum_dataset's data loading, then replace the mixer
+    # with a simple ConcatDataset.
+    from torch.utils.data import ConcatDataset
+
+    common_transform = transforms.Compose([
+        transforms.Resize((final_reso, final_reso),
+                          interpolation=InterpolationMode.LANCZOS),
+        transforms.ToTensor(),
+        normalize_01_into_pm1,
+    ])
+
+    from torch.utils.data import random_split
+
+    datasets_train = []
+    val_set = None
+
+    # ---- Old dataset (OmniStyle) ----
+    if old_data_path and osp.isdir(old_data_path):
+        target_link = osp.join(old_data_path, "target")
+        if not osp.exists(target_link):
+            for candidate in ("OmniStyle-150K", "OmniStyle-150k"):
+                real = osp.join(old_data_path, candidate)
+                if osp.isdir(real):
+                    os.symlink(osp.abspath(real), target_link)
+                    print(f"[OmniStyle] Created symlink: target -> {candidate}")
+                    break
+
+    old_has_data = (old_data_path
+                    and (osp.isdir(osp.join(old_data_path, "target"))
+                         or osp.islink(osp.join(old_data_path, "target"))))
+    if old_has_data:
+        train_fl = _read_file_list(osp.join(old_data_path, "train_files.txt"))
+        val_fl = _read_file_list(osp.join(old_data_path, "val_files.txt"))
+        if train_fl is not None and val_fl is not None:
+            old_train = StyleTransferDataset(root_dir=old_data_path,
+                                             transform=common_transform,
+                                             file_list=train_fl)
+            old_val = StyleTransferDataset(root_dir=old_data_path,
+                                           transform=common_transform,
+                                           file_list=val_fl)
+        else:
+            full_old = StyleTransferDataset(root_dir=old_data_path, transform=None)
+            n = len(full_old)
+            val_n = max(int(n * 0.05), 1)
+            tr_sub, va_sub = random_split(full_old, [n - val_n, val_n],
+                                          generator=torch.Generator().manual_seed(42))
+            old_train = SubsetWrapper(tr_sub, common_transform)
+            old_val = SubsetWrapper(va_sub, common_transform)
+        datasets_train.append(old_train)
+        val_set = old_val
+        print(f"[Concat] OmniStyle  train={len(old_train)}, val={len(old_val)}")
+
+    # ---- New dataset (ImagePulse) ----
+    if (not new_data_path or not osp.isdir(new_data_path)) and \
+       new_data_tar_dir and osp.isdir(new_data_tar_dir):
+        new_data_path = osp.join(osp.dirname(new_data_tar_dir),
+                                 "imagepulse_extracted")
+        extract_imagepulse_tars(new_data_tar_dir, new_data_path)
+
+    new_has_data = (new_data_path and osp.isdir(new_data_path))
+    if new_has_data:
+        train_fl = _read_file_list(osp.join(new_data_path, "train_files.txt"))
+        val_fl = _read_file_list(osp.join(new_data_path, "val_files.txt"))
+        if train_fl and val_fl:
+            organised_target = osp.join(new_data_path, "target")
+            if osp.isdir(organised_target):
+                new_train = StyleTransferDataset(root_dir=new_data_path,
+                                                 transform=common_transform,
+                                                 file_list=train_fl)
+                new_val = StyleTransferDataset(root_dir=new_data_path,
+                                               transform=common_transform,
+                                               file_list=val_fl)
+            else:
+                new_train = ImagePulseDataset(root_dir=new_data_path,
+                                              transform=common_transform,
+                                              file_list=train_fl)
+                new_val = ImagePulseDataset(root_dir=new_data_path,
+                                            transform=common_transform,
+                                            file_list=val_fl)
+        else:
+            full_new = ImagePulseDataset(root_dir=new_data_path, transform=None)
+            if len(full_new) > 0:
+                n = len(full_new)
+                val_n = max(int(n * 0.05), 1)
+                tr_sub, va_sub = random_split(
+                    full_new, [n - val_n, val_n],
+                    generator=torch.Generator().manual_seed(42))
+                new_train = SubsetWrapper(tr_sub, common_transform)
+                new_val = SubsetWrapper(va_sub, common_transform)
+            else:
+                new_train = new_val = None
+
+        if new_train is not None:
+            datasets_train.append(new_train)
+            if val_set is None:
+                val_set = new_val
+            print(f"[Concat] ImagePulse train={len(new_train)}, val={len(new_val)}")
+
+    assert len(datasets_train) > 0, "No training data found!"
+    assert val_set is not None, "No validation data found!"
+
+    train_set = ConcatDataset(datasets_train) if len(datasets_train) > 1 else datasets_train[0]
+    print(f"[Concat] Final  train_len={len(train_set)} "
+          f"({' + '.join(str(len(d)) for d in datasets_train)}), val_len={len(val_set)}")
+    return 1000, train_set, val_set

@@ -68,17 +68,28 @@ def build_everything(args: arg_util.Args):
     if not args.local_debug:
         print(f'[build PT data] ...\n')
         if args.new_data_path or args.new_data_tar_dir:
-            # ---- Curriculum mixed fine-tuning ----
-            from utils.data import build_curriculum_dataset
-            _, dataset_train, dataset_val = build_curriculum_dataset(
-                old_data_path=args.data_path,
-                new_data_path=args.new_data_path,
-                new_data_tar_dir=args.new_data_tar_dir,
-                final_reso=args.data_load_reso,
-                start_ratio=args.curriculum_start,
-                hflip=args.hflip, mid_reso=args.mid_reso,
-            )
-            curriculum_dataset = dataset_train  # keep ref for ratio updates
+            if getattr(args, 'concat_datasets', False):
+                # ---- Concat mode: one epoch = ALL samples from both datasets ----
+                from utils.data import build_concat_dataset
+                _, dataset_train, dataset_val = build_concat_dataset(
+                    old_data_path=args.data_path,
+                    new_data_path=args.new_data_path,
+                    new_data_tar_dir=args.new_data_tar_dir,
+                    final_reso=args.data_load_reso,
+                    hflip=args.hflip, mid_reso=args.mid_reso,
+                )
+            else:
+                # ---- Curriculum mixed fine-tuning ----
+                from utils.data import build_curriculum_dataset
+                _, dataset_train, dataset_val = build_curriculum_dataset(
+                    old_data_path=args.data_path,
+                    new_data_path=args.new_data_path,
+                    new_data_tar_dir=args.new_data_tar_dir,
+                    final_reso=args.data_load_reso,
+                    start_ratio=args.curriculum_start,
+                    hflip=args.hflip, mid_reso=args.mid_reso,
+                )
+            curriculum_dataset = dataset_train if not getattr(args, 'concat_datasets', False) else None
         else:
             # ---- Original OmniStyle-only training ----
             _, dataset_train, dataset_val = build_dataset(
@@ -374,6 +385,7 @@ def main_training():
     best_val_loss_mean, best_val_loss_tail, best_val_acc_mean, best_val_acc_tail = 999, 999, -1, -1
 
     L_mean, L_tail = -1, -1
+    best_val_state = {'best_val_loss_tail': best_val_loss_tail}  # shared dict for mid-epoch updates
     for ep in range(start_ep, args.ep):
         # ---- Curriculum ratio update (linear schedule) ----
         if curriculum_dataset is not None:
@@ -392,7 +404,7 @@ def main_training():
         tb_lg.set_step(ep * iters_train)
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer,
-            wandb_run=wandb_run,
+            wandb_run=wandb_run, ld_val=ld_val, best_val_state=best_val_state,
         )
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
@@ -405,8 +417,10 @@ def main_training():
         is_val_and_also_saving = (ep + 1) % 1 == 0 or (ep + 1) == args.ep
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
+            best_val_loss_tail = best_val_state['best_val_loss_tail']  # sync from mid-epoch updates
             best_updated = best_val_loss_tail > val_loss_tail
             best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, val_loss_mean), min(best_val_loss_tail, val_loss_tail)
+            best_val_state['best_val_loss_tail'] = best_val_loss_tail  # sync back
             best_val_acc_mean, best_val_acc_tail = max(best_val_acc_mean, val_acc_mean), max(best_val_acc_tail, val_acc_tail)
             AR_ep_loss.update(vL_mean=val_loss_mean, vL_tail=val_loss_tail, vacc_mean=val_acc_mean, vacc_tail=val_acc_tail)
             args.vL_mean, args.vL_tail, args.vacc_mean, args.vacc_tail = val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail
@@ -465,7 +479,7 @@ def main_training():
     dist.barrier()
 
 
-def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer, wandb_run=None):
+def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args, tb_lg: misc.TensorboardLogger, ld_or_itrt, iters_train: int, trainer, wandb_run=None, ld_val=None, best_val_state=None):
     # import heavy packages after Dataloader object creation
     # --- MODIFIED IMPORT ---
     from fine_tuner import StyleVARTrainer
@@ -565,9 +579,26 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
                 roll_state, args.local_out_dir_path,
                 max_slots=args.max_rolling,
             )
-            # also keep ar-ckpt-last.pth up to date
             misc.atomic_save(roll_state, os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'))
             print(f'[rolling ckpt] ep{ep} it{it+1}/{iters_train} -> {os.path.basename(roll_path)}', flush=True, clean=True)
+
+        # --- Mid-epoch validation every val_every iterations ---
+        val_every = getattr(args, 'val_every', 0)
+        if val_every > 0 and (it + 1) % val_every == 0 and dist.is_local_master():
+            if ld_val is not None and best_val_state is not None:
+                # save current state first (so best can copy from it)
+                _state = {
+                    'epoch': ep, 'iter': it + 1,
+                    'trainer': trainer.state_dict(), 'args': args.state_dict(),
+                }
+                misc.atomic_save(_state, os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'))
+                vl_m, vl_t, va_m, va_t, tot, cost = trainer.eval_ep(ld_val)
+                print(f'  [mid-val] ep{ep} it{it+1}  vL_tail={vl_t:.4f}  cost={cost:.1f}s', flush=True)
+                if vl_t < best_val_state['best_val_loss_tail']:
+                    best_val_state['best_val_loss_tail'] = vl_t
+                    shutil.copy(os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth'),
+                                os.path.join(args.local_out_dir_path, 'ar-ckpt-best.pth'))
+                    print(f'  [mid-val] best updated (vL_tail={vl_t:.4f})', flush=True)
 
     me.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in me.meters.items()}, me.iter_time.time_preds(max_it - (g_it + 1) + (args.ep - ep) * 15)  # +15: other cost
