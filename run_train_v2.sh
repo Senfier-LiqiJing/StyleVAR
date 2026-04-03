@@ -20,8 +20,8 @@ mkdir -p "${OUTPUT_DIR}"
 nohup torchrun --nproc_per_node=1 "${SCRIPT_DIR}/fine_tune.py" \
     --fp16 2 \
     --bs 56 --ac 4 \
-    --tblr 2e-3 \
-    --ep 10 \
+    --tblr 1e-3 \
+    --ep 20 \
     --data_path "${SCRIPT_DIR}/data/OmniStyle-150k" \
     --new_data_path "${SCRIPT_DIR}/data/ImagePulse" \
     --concat_datasets True \
