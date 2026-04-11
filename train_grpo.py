@@ -391,14 +391,27 @@ class DreamSimReward(nn.Module):
     """
 
     def __init__(self, device: torch.device, dreamsim_type: str = "dino_vitb16",
-                 cache_dir: str = "ckpt/dreamsim"):
+                 cache_dir: str = None):
         super().__init__()
         from dreamsim import dreamsim
+        # Default cache_dir = <project_root>/ckpt/dreamsim (absolute path,
+        # independent of CWD so it works regardless of where the script is run from).
+        if cache_dir is None:
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            cache_dir = os.path.join(project_root, "ckpt", "dreamsim")
+        cache_dir = os.path.abspath(cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
+        print(f"[DreamSim] cache_dir = {cache_dir}")
+        # Verify cache contents before loading (so we fail loudly if scp was incomplete)
+        required = {
+            "dino_vitb16": ["dino_vitb16_pretrain.pth", "dino_vitb16_single_lora"],
+        }[dreamsim_type]
+        missing = [r for r in required
+                   if not os.path.exists(os.path.join(cache_dir, r))]
+        if missing:
+            print(f"[DreamSim] WARNING: cache missing {missing} — will attempt download")
         # Use single DINO backbone (not ensemble) to save memory. Ensemble is
         # DINO+CLIP+OpenCLIP which is ~1.2GB; dino_vitb16 alone is ~330MB.
-        # cache_dir avoids polluting the `models/` Python package directory
-        # (DreamSim defaults to cache_dir='./models').
         self.model, _ = dreamsim(pretrained=True, device=device,
                                   dreamsim_type=dreamsim_type,
                                   cache_dir=cache_dir)
