@@ -26,7 +26,7 @@ nohup python -u "${SCRIPT_DIR}/train_grpo.py" \
     --sft_out_dir "${SCRIPT_DIR}/Output_v2" \
     --out_dir "${OUTPUT_DIR}" \
     --use_lora --lora_rank 256 --lora_alpha 512 \
-    --G 8 --batch_size 6 \
+    --G 8 --batch_size 12 \
     --lr 1e-5 --kl_coef 0.02 --kl_target 0 --grad_clip 1.0 \
     --merge_cooldown 200 --merge_min_gain 0.05 --merge_patience 100 \
     --epochs 10 \
