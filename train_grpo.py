@@ -51,9 +51,16 @@ def parse_args():
     p = argparse.ArgumentParser("GRPO training for StyleVAR")
     # paths
     p.add_argument("--content_dir", type=str, default="data/coco2017/images/train2017",
-                    help="Directory with content images (recursive search)")
+                    help="Directory with content images (legacy unpaired mode)")
     p.add_argument("--style_dir",   type=str, default="data/wikiart",
-                    help="Directory with style images (recursive search)")
+                    help="Directory with style images (legacy unpaired mode)")
+    # paired mode (recommended): uses (content, style, target) triplets
+    p.add_argument("--paired_data", action="store_true",
+                    help="Use paired (content, style, target) datasets for DreamSim reward")
+    p.add_argument("--old_data_path", type=str, default="data/OmniStyle-150k",
+                    help="OmniStyle triplet root (when --paired_data)")
+    p.add_argument("--new_data_path", type=str, default="data/ImagePulse",
+                    help="ImagePulse triplet root (when --paired_data)")
     p.add_argument("--vae_ckpt",  type=str, default="ckpt/vae_ch160v4096z32.pth")
     p.add_argument("--var_ckpt",  type=str, default="",
                     help="StyleVAR checkpoint (SFT result). Empty=use best/last from --sft_out_dir")
@@ -66,12 +73,24 @@ def parse_args():
     p.add_argument("--kl_target",    type=float, default=0.2,   help="Target per-step raw KL for adaptive coefficient (0=fixed)")
     p.add_argument("--clip_eps",     type=float, default=0.2,   help="PPO-style clipping epsilon")
     p.add_argument("--ref_update_every", type=int, default=0,
-                    help="Merge LoRA into base & reinit every N steps (0=never, i.e. fixed reference)")
-    # reward weights
+                    help="[LEGACY] Merge LoRA every N steps (0=disabled, use peak-triggered instead)")
+    # Peak-triggered iterative merge (preferred over ref_update_every)
+    p.add_argument("--merge_cooldown", type=int, default=0,
+                    help="Minimum steps between merges (0=disable peak-triggered merging)")
+    p.add_argument("--merge_min_gain", type=float, default=0.05,
+                    help="Required reward_ema improvement over last-merge baseline")
+    p.add_argument("--merge_patience", type=int, default=100,
+                    help="Steps to wait at peak before confirming merge trigger")
+    # reward weights (legacy LPIPS+Gram+SSIM path)
     p.add_argument("--lam_content",  type=float, default=1.0,   help="Weight for LPIPS content reward")
     p.add_argument("--lam_style",    type=float, default=1.0,   help="Weight for VGG Gram style reward")
     p.add_argument("--lam_tv",       type=float, default=0.01,  help="Weight for TV quality reward")
     p.add_argument("--lam_ssim",     type=float, default=0.5,   help="Weight for SSIM structure reward")
+    # DreamSim reward (when --paired_data)
+    p.add_argument("--use_dreamsim", action="store_true",
+                    help="Use DreamSim(gen, target) as the sole reward (requires --paired_data)")
+    p.add_argument("--dreamsim_scale", type=float, default=5.0,
+                    help="Multiplier on -dreamsim distance for advantage scale")
     # training
     p.add_argument("--epochs",       type=int,   default=5)
     p.add_argument("--batch_size",   type=int,   default=6,     help="Condition pairs per step")
@@ -360,6 +379,46 @@ def _load_lpips_alex(device: torch.device):
     for p in net.parameters():
         p.requires_grad_(False)
     return net
+
+
+class DreamSimReward(nn.Module):
+    """DreamSim perceptual similarity reward.
+
+    Returns negative DreamSim distance so higher = more similar.
+    DreamSim is a learned perceptual metric (DINO-based) aligned with human
+    judgment of holistic image similarity. Unlike LPIPS (low-level texture),
+    DreamSim captures semantic/structural similarity.
+    """
+
+    def __init__(self, device: torch.device, dreamsim_type: str = "dino_vitb16",
+                 cache_dir: str = "ckpt/dreamsim"):
+        super().__init__()
+        from dreamsim import dreamsim
+        os.makedirs(cache_dir, exist_ok=True)
+        # Use single DINO backbone (not ensemble) to save memory. Ensemble is
+        # DINO+CLIP+OpenCLIP which is ~1.2GB; dino_vitb16 alone is ~330MB.
+        # cache_dir avoids polluting the `models/` Python package directory
+        # (DreamSim defaults to cache_dir='./models').
+        self.model, _ = dreamsim(pretrained=True, device=device,
+                                  dreamsim_type=dreamsim_type,
+                                  cache_dir=cache_dir)
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.eval()
+        self._target_size = 224
+
+    @torch.no_grad()
+    def forward(self, gen_01: torch.Tensor, target_01: torch.Tensor) -> torch.Tensor:
+        """Both inputs: [B,3,H,W] in [0,1]. DreamSim handles its own normalization.
+        Returns (B,) — higher = more similar (we negate the distance)."""
+        if gen_01.shape[-1] != self._target_size:
+            gen_01 = F.interpolate(gen_01, size=self._target_size,
+                                    mode="bilinear", align_corners=False)
+        if target_01.shape[-1] != self._target_size:
+            target_01 = F.interpolate(target_01, size=self._target_size,
+                                       mode="bilinear", align_corners=False)
+        dist = self.model(gen_01, target_01)  # (B,) in [0, ~1]
+        return -dist
 
 
 # ======================== Model Building ===================================
@@ -725,11 +784,18 @@ def main():
     print(f"[GRPO] Trainable params: {total_train:,} ({total_train/721e6*100:.1f}%)")
 
     # ---- 2. Reward models ----
-    lpips_net = _load_lpips_alex(DEV)
-    vgg_gram  = VGGGramStyleReward().to(DEV)
-    tv_reward_fn = TVReward().to(DEV)
-    ssim_reward_fn = SSIMReward().to(DEV)
-    print(f"[GRPO] Reward models loaded on {DEV}")
+    dreamsim_net = None
+    lpips_net = vgg_gram = tv_reward_fn = ssim_reward_fn = None
+    if args.use_dreamsim:
+        assert args.paired_data, "--use_dreamsim requires --paired_data"
+        dreamsim_net = DreamSimReward(device=DEV)
+        print(f"[GRPO] DreamSim reward loaded on {DEV}")
+    else:
+        lpips_net = _load_lpips_alex(DEV)
+        vgg_gram  = VGGGramStyleReward().to(DEV)
+        tv_reward_fn = TVReward().to(DEV)
+        ssim_reward_fn = SSIMReward().to(DEV)
+        print(f"[GRPO] Legacy reward models (LPIPS+Gram+SSIM+TV) loaded on {DEV}")
 
     # ---- 3. Optimizer ----
     optimizer = torch.optim.AdamW(train_params, lr=args.lr,
@@ -777,14 +843,26 @@ def main():
         transforms.ToTensor(),
         normalize_01_into_pm1,
     ])
-    dataset = UnpairedStyleContentDataset(
-        content_dir=args.content_dir, style_dir=args.style_dir,
-        transform=transform)
+    if args.paired_data:
+        # Reuse SFT's build_concat_dataset: returns (target, style, content)
+        from utils.data import build_concat_dataset
+        _, dataset, _ = build_concat_dataset(
+            old_data_path=args.old_data_path,
+            new_data_path=args.new_data_path,
+            new_data_tar_dir="",
+            final_reso=256,
+        )
+        paired = True
+    else:
+        dataset = UnpairedStyleContentDataset(
+            content_dir=args.content_dir, style_dir=args.style_dir,
+            transform=transform)
+        paired = False
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=4, pin_memory=True, drop_last=True,
     )
-    print(f"[GRPO] Dataset: {len(dataset)} samples, bs={args.batch_size}")
+    print(f"[GRPO] Dataset: {len(dataset)} samples, bs={args.batch_size}, paired={paired}")
     print(f"[GRPO] Steps/epoch: {len(dataloader)}, total: {len(dataloader)*args.epochs}")
 
     # ---- 7. Training loop ----
@@ -794,10 +872,24 @@ def main():
     kl_coef = args.kl_coef  # fixed coefficient
     has_merged = False  # track if LoRA has been merged (changes save strategy)
 
+    # ---- Peak-triggered merge state (only if merge_cooldown > 0) ----
+    ref_reward_ema = None         # reward_ema at time of last merge (or initial baseline)
+    peak_since_merge = -float('inf')
+    steps_at_peak = 0
+    steps_since_merge = 0
+    merge_count = 0
+
     for epoch in range(start_epoch, args.epochs):
         t_epoch = time.time()
-        for batch_idx, (style_pm1, content_pm1) in enumerate(dataloader):
+        for batch_idx, batch in enumerate(dataloader):
             t0 = time.time()
+            # Unpack: paired=(target, style, content), unpaired=(style, content)
+            if paired:
+                target_pm1, style_pm1, content_pm1 = batch
+                target_dev = target_pm1.to(DEV, non_blocking=True)
+            else:
+                style_pm1, content_pm1 = batch
+                target_dev = None
             B = style_pm1.shape[0]
 
             style_dev   = style_pm1.to(DEV, non_blocking=True)
@@ -858,13 +950,22 @@ def main():
             style_01   = (style_dev + 1) * 0.5    # [-1,1] -> [0,1], no in-place
             content_01 = (content_dev + 1) * 0.5
 
-            rewards, r_content, r_style, r_tv, r_ssim = compute_rewards(
-                gen_images_01, style_01, content_01, G=args.G,
-                lpips_net=lpips_net, vgg_gram=vgg_gram, tv_reward=tv_reward_fn,
-                ssim_reward=ssim_reward_fn,
-                lam_content=args.lam_content, lam_style=args.lam_style,
-                lam_tv=args.lam_tv, lam_ssim=args.lam_ssim,
-            )
+            if args.use_dreamsim:
+                # DreamSim(gen, target) as sole reward
+                target_01 = (target_dev + 1) * 0.5
+                target_exp = target_01.repeat(args.G, 1, 1, 1)  # (B*G, 3, H, W)
+                r_dream = dreamsim_net(gen_images_01, target_exp)  # (B*G,) in [-1, 0]
+                rewards = r_dream * args.dreamsim_scale
+                r_content = r_style = r_tv = r_ssim = torch.zeros_like(rewards)
+                del target_exp, target_01
+            else:
+                rewards, r_content, r_style, r_tv, r_ssim = compute_rewards(
+                    gen_images_01, style_01, content_01, G=args.G,
+                    lpips_net=lpips_net, vgg_gram=vgg_gram, tv_reward=tv_reward_fn,
+                    ssim_reward=ssim_reward_fn,
+                    lam_content=args.lam_content, lam_style=args.lam_style,
+                    lam_tv=args.lam_tv, lam_ssim=args.lam_ssim,
+                )
             advantages = compute_group_advantages(rewards, args.G)
             rewards_mean = rewards.mean().item()
             r_content_mean = r_content.mean().item()
@@ -875,6 +976,17 @@ def main():
                 reward_ema = rewards_mean
             else:
                 reward_ema = reward_ema_beta * reward_ema + (1 - reward_ema_beta) * rewards_mean
+
+            # ---- Peak-triggered merge: update tracking state ----
+            if args.merge_cooldown > 0:
+                if ref_reward_ema is None:
+                    ref_reward_ema = reward_ema   # initial baseline = first observed reward
+                steps_since_merge += 1
+                if reward_ema > peak_since_merge:
+                    peak_since_merge = reward_ema
+                    steps_at_peak = 0              # new peak, reset patience counter
+                else:
+                    steps_at_peak += 1
 
             # Debug: reward/advantage diagnostics on first 3 steps
             if global_step <= 2:
@@ -963,21 +1075,46 @@ def main():
             #   - Upward-only: ratcheted to 0.22, killed learning (Run 16)
             # Fixed kl_coef + KL spike skip (>0.5) is sufficient.
 
-            # ---- Periodic reference update (iterative GRPO) ----
-            if (args.ref_update_every > 0
-                    and (global_step + 1) % args.ref_update_every == 0):
-                print(f"  [REF UPDATE] Merging LoRA into base at step {global_step+1}", flush=True)
-                # Save full model state BEFORE merge (this is the best policy so far)
+            # ---- Iterative reference update ----
+            # Mode 1: peak-triggered (preferred). Only merges when policy is
+            #         provably better than last merge baseline AND has plateaued.
+            # Mode 2: fixed interval (legacy, unsafe — can ratchet reward down).
+            should_merge = False
+            merge_reason = ""
+            if args.merge_cooldown > 0 and ref_reward_ema is not None:
+                cooldown_ok = steps_since_merge >= args.merge_cooldown
+                gain_ok = (peak_since_merge - ref_reward_ema) >= args.merge_min_gain
+                patience_ok = steps_at_peak >= args.merge_patience
+                if cooldown_ok and gain_ok and patience_ok:
+                    should_merge = True
+                    merge_reason = (
+                        f"peak={peak_since_merge:.4f} ref={ref_reward_ema:.4f} "
+                        f"gain={peak_since_merge-ref_reward_ema:+.4f} "
+                        f"steps_at_peak={steps_at_peak} "
+                        f"steps_since_merge={steps_since_merge}"
+                    )
+            elif args.ref_update_every > 0 and (global_step + 1) % args.ref_update_every == 0:
+                should_merge = True
+                merge_reason = f"fixed interval (every {args.ref_update_every})"
+
+            if should_merge:
+                print(f"  [MERGE] step={global_step+1}  {merge_reason}", flush=True)
+                # Save full model state BEFORE merge (the policy being captured as new ref)
                 _save_grpo_ckpt(model, optimizer, scaler, global_step + 1, epoch, args,
                                 f"pre_merge_step{global_step+1}", full_state=True)
                 train_params = merge_lora_and_reinit(model)
                 optimizer = torch.optim.AdamW(train_params, lr=args.lr,
                                                betas=(0.9, 0.95), weight_decay=0.01)
-                # Save full state AFTER merge (for resume — base_weight has changed)
                 _save_grpo_ckpt(model, optimizer, scaler, global_step + 1, epoch, args,
                                 "latest", full_state=True)
                 has_merged = True
-                print(f"  [REF UPDATE] Done. KL will reset to ~0.", flush=True)
+                merge_count += 1
+                # Reset peak-tracking: new baseline = peak we just captured
+                ref_reward_ema = peak_since_merge
+                peak_since_merge = -float('inf')
+                steps_at_peak = 0
+                steps_since_merge = 0
+                print(f"  [MERGE] done. new ref_reward={ref_reward_ema:.4f}  merge_count={merge_count}", flush=True)
 
             # ---- Cleanup ----
             del old_logprobs, ref_logprobs, advantages, rewards
@@ -1018,6 +1155,11 @@ def main():
                         "grpo/kl_coef": kl_coef,
                         "grpo/lr": optimizer.param_groups[0]["lr"],
                         "grpo/mem_gb": mem,
+                        "merge/ref_reward_ema": ref_reward_ema if ref_reward_ema is not None else 0.0,
+                        "merge/peak_since_merge": peak_since_merge if peak_since_merge > -float('inf') else 0.0,
+                        "merge/steps_at_peak": steps_at_peak,
+                        "merge/steps_since_merge": steps_since_merge,
+                        "merge/count": merge_count,
                     }, step=global_step)
 
             # ---- Rolling checkpoint (5 slots) ----

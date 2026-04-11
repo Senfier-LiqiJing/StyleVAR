@@ -8,6 +8,15 @@ llava/
 _vis_cached/
 _auto_*
 ckpt/
+# DreamSim accidental downloads (if cache_dir not set properly, falls back to ./models)
+models/pretrained.zip
+models/checkpoints/
+models/ensemble_lora/
+models/facebookresearch_dino_main/
+models/dino_vitb16_pretrain.pth
+models/clip_vitb16_pretrain.pth.tar
+models/open_clip_vitb16_pretrain.pth.tar
+models/trusted_list
 log/
 tb*/
 img*/
