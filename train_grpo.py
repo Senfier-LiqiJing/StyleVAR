@@ -980,12 +980,14 @@ def main():
             style_01   = (style_dev + 1) * 0.5    # [-1,1] -> [0,1], no in-place
             content_01 = (content_dev + 1) * 0.5
 
+            r_dream_mean = 0.0  # unscaled raw -dreamsim distance (for logging)
             if args.use_dreamsim:
                 # DreamSim(gen, target) as sole reward
                 target_01 = (target_dev + 1) * 0.5
                 target_exp = target_01.repeat(args.G, 1, 1, 1)  # (B*G, 3, H, W)
                 r_dream = dreamsim_net(gen_images_01, target_exp)  # (B*G,) in [-1, 0]
                 rewards = r_dream * args.dreamsim_scale
+                r_dream_mean = r_dream.mean().item()  # raw, unscaled
                 r_content = r_style = r_tv = r_ssim = torch.zeros_like(rewards)
                 del target_exp, target_01
             else:
@@ -1158,6 +1160,11 @@ def main():
             # ---- Logging ----
             if global_step % args.log_every == 0:
                 mem = torch.cuda.max_memory_allocated(DEV) / 1e9
+                if args.use_dreamsim:
+                    reward_detail = f"[dream={r_dream_mean:.4f}]"
+                else:
+                    reward_detail = (f"[c={r_content_mean:.4f} s={r_style_mean:.4f} "
+                                     f"ssim={r_ssim_mean:.4f} tv={r_tv_mean:.4f}]")
                 print(
                     f"[Ep {epoch+1}/{args.epochs}] "
                     f"Step {global_step:5d} | "
@@ -1165,22 +1172,18 @@ def main():
                     f"policy={total_policy_loss:.4f} "
                     f"kl={total_kl_loss:.4f} kl_coef={kl_coef:.4f} | "
                     f"R={rewards_mean:.4f} R_ema={reward_ema:.4f} "
-                    f"[c={r_content_mean:.4f} s={r_style_mean:.4f} ssim={r_ssim_mean:.4f} tv={r_tv_mean:.4f}] | "
+                    f"{reward_detail} | "
                     f"grad={grad_norm:.3f} | "
                     f"mem={mem:.1f}G | "
                     f"{dt:.1f}s/step"
                 )
                 if wandb_run is not None:
-                    wandb_run.log({
+                    wandb_log = {
                         "grpo/policy_loss": total_policy_loss,
                         "grpo/kl_loss": total_kl_loss,
                         "grpo/total_loss": total_policy_loss + total_kl_loss,
                         "grpo/reward_mean": rewards_mean,
                         "grpo/reward_ema": reward_ema,
-                        "reward/content (neg LPIPS)": r_content_mean,
-                        "reward/style (neg Gram)": r_style_mean,
-                        "reward/ssim (structure)": r_ssim_mean,
-                        "reward/tv (neg TV)": r_tv_mean,
                         "grpo/grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
                         "grpo/kl_coef": kl_coef,
                         "grpo/lr": optimizer.param_groups[0]["lr"],
@@ -1190,7 +1193,15 @@ def main():
                         "merge/steps_at_peak": steps_at_peak,
                         "merge/steps_since_merge": steps_since_merge,
                         "merge/count": merge_count,
-                    }, step=global_step)
+                    }
+                    if args.use_dreamsim:
+                        wandb_log["reward/dreamsim (neg distance)"] = r_dream_mean
+                    else:
+                        wandb_log["reward/content (neg LPIPS)"] = r_content_mean
+                        wandb_log["reward/style (neg Gram)"] = r_style_mean
+                        wandb_log["reward/ssim (structure)"] = r_ssim_mean
+                        wandb_log["reward/tv (neg TV)"] = r_tv_mean
+                    wandb_run.log(wandb_log, step=global_step)
 
             # ---- Rolling checkpoint (5 slots) ----
             if global_step % args.save_every == 0:
