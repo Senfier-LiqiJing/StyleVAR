@@ -394,6 +394,7 @@ class DreamSimReward(nn.Module):
                  cache_dir: str = None):
         super().__init__()
         from dreamsim import dreamsim
+        import sys
         # Default cache_dir = <project_root>/ckpt/dreamsim (absolute path,
         # independent of CWD so it works regardless of where the script is run from).
         if cache_dir is None:
@@ -402,7 +403,7 @@ class DreamSimReward(nn.Module):
         cache_dir = os.path.abspath(cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
         print(f"[DreamSim] cache_dir = {cache_dir}")
-        # Verify cache contents before loading (so we fail loudly if scp was incomplete)
+        # Verify cache contents before loading
         required = {
             "dino_vitb16": ["dino_vitb16_pretrain.pth", "dino_vitb16_single_lora"],
         }[dreamsim_type]
@@ -410,11 +411,27 @@ class DreamSimReward(nn.Module):
                    if not os.path.exists(os.path.join(cache_dir, r))]
         if missing:
             print(f"[DreamSim] WARNING: cache missing {missing} — will attempt download")
-        # Use single DINO backbone (not ensemble) to save memory. Ensemble is
-        # DINO+CLIP+OpenCLIP which is ~1.2GB; dino_vitb16 alone is ~330MB.
-        self.model, _ = dreamsim(pretrained=True, device=device,
-                                  dreamsim_type=dreamsim_type,
-                                  cache_dir=cache_dir)
+
+        # HACK: DINO's hubconf imports `vision_transformer` which does
+        # `from utils import trunc_normal_`. Python sys.modules already has
+        # StyleVAR's `utils/` package cached, causing ImportError. Temporarily
+        # evict StyleVAR's `utils` from sys.modules so DINO's local utils.py
+        # gets loaded via torch.hub's sys.path injection. Restore after.
+        saved_utils_modules = {}
+        for k in list(sys.modules.keys()):
+            if k == "utils" or k.startswith("utils."):
+                saved_utils_modules[k] = sys.modules.pop(k)
+        try:
+            self.model, _ = dreamsim(pretrained=True, device=device,
+                                      dreamsim_type=dreamsim_type,
+                                      cache_dir=cache_dir)
+        finally:
+            # Remove any DINO-side 'utils' / 'vision_transformer' leftovers
+            # to avoid collision with StyleVAR's utils on restore.
+            for k in list(sys.modules.keys()):
+                if k == "utils" or k == "vision_transformer" or k.startswith("utils."):
+                    sys.modules.pop(k, None)
+            sys.modules.update(saved_utils_modules)
         for p in self.parameters():
             p.requires_grad_(False)
         self.eval()
