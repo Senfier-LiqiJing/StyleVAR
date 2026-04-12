@@ -28,7 +28,8 @@ nohup python -u "${SCRIPT_DIR}/train_grpo.py" \
     --use_lora --lora_rank 256 --lora_alpha 512 \
     --G 8 --batch_size 16 \
     --lr 1e-5 --kl_coef 0.02 --kl_target 0 --grad_clip 1.0 \
-    --merge_cooldown 200 --merge_min_gain 0.05 --merge_patience 100 \
+    --merge_cooldown 200 --merge_min_gain 0.02 --merge_patience 30 \
+    --merge_kl_threshold 0.5 --save_peak_lora \
     --epochs 10 \
     --save_every 200 \
     --use_dreamsim --dreamsim_scale 5.0 \

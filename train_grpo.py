@@ -77,10 +77,14 @@ def parse_args():
     # Peak-triggered iterative merge (preferred over ref_update_every)
     p.add_argument("--merge_cooldown", type=int, default=0,
                     help="Minimum steps between merges (0=disable peak-triggered merging)")
-    p.add_argument("--merge_min_gain", type=float, default=0.05,
+    p.add_argument("--merge_min_gain", type=float, default=0.02,
                     help="Required reward_ema improvement over last-merge baseline")
-    p.add_argument("--merge_patience", type=int, default=100,
+    p.add_argument("--merge_patience", type=int, default=30,
                     help="Steps to wait at peak before confirming merge trigger")
+    p.add_argument("--merge_kl_threshold", type=float, default=0.5,
+                    help="Emergency merge if raw KL exceeds this (0=disabled). Catches KL runaway before collapse.")
+    p.add_argument("--save_peak_lora", action="store_true",
+                    help="Snapshot LoRA weights at every new peak; use snapshot for merge instead of current weights.")
     # reward weights (legacy LPIPS+Gram+SSIM path)
     p.add_argument("--lam_content",  type=float, default=1.0,   help="Weight for LPIPS content reward")
     p.add_argument("--lam_style",    type=float, default=1.0,   help="Weight for VGG Gram style reward")
@@ -215,6 +219,42 @@ def set_lora_enabled(model: StyleVAR, enabled: bool):
             module = getattr(block.ffn, attr_name)
             if isinstance(module, LoRALinear):
                 module._enabled = enabled
+
+
+def snapshot_lora(model: StyleVAR) -> dict:
+    """Return a CPU copy of all LoRA parameter tensors, keyed by module id."""
+    snap = {}
+    for block in model.blocks:
+        for attr_name in ("mat_qkv_guide", "mat_qkv_target", "proj"):
+            m = getattr(block.attn, attr_name)
+            if isinstance(m, LoRALinear):
+                snap[id(m)] = (m.lora_A.detach().clone().cpu(),
+                               m.lora_B.detach().clone().cpu())
+        for attr_name in ("fc1", "fc2"):
+            m = getattr(block.ffn, attr_name)
+            if isinstance(m, LoRALinear):
+                snap[id(m)] = (m.lora_A.detach().clone().cpu(),
+                               m.lora_B.detach().clone().cpu())
+    return snap
+
+
+def restore_lora(model: StyleVAR, snap: dict):
+    """Write snapshotted LoRA tensors back into the model (in place)."""
+    for block in model.blocks:
+        for attr_name in ("mat_qkv_guide", "mat_qkv_target", "proj"):
+            m = getattr(block.attn, attr_name)
+            if isinstance(m, LoRALinear) and id(m) in snap:
+                A, B = snap[id(m)]
+                with torch.no_grad():
+                    m.lora_A.copy_(A.to(m.lora_A.device))
+                    m.lora_B.copy_(B.to(m.lora_B.device))
+        for attr_name in ("fc1", "fc2"):
+            m = getattr(block.ffn, attr_name)
+            if isinstance(m, LoRALinear) and id(m) in snap:
+                A, B = snap[id(m)]
+                with torch.no_grad():
+                    m.lora_A.copy_(A.to(m.lora_A.device))
+                    m.lora_B.copy_(B.to(m.lora_B.device))
 
 
 def merge_lora_and_reinit(model: StyleVAR) -> List[nn.Parameter]:
@@ -908,6 +948,7 @@ def main():
     steps_at_peak = 0
     steps_since_merge = 0
     merge_count = 0
+    peak_lora_snapshot = None     # CPU snapshot of LoRA weights at last peak (if save_peak_lora)
 
     for epoch in range(start_epoch, args.epochs):
         t_epoch = time.time()
@@ -1017,6 +1058,9 @@ def main():
                 if reward_ema > peak_since_merge:
                     peak_since_merge = reward_ema
                     steps_at_peak = 0              # new peak, reset patience counter
+                    # Snapshot LoRA weights at this peak (before any degradation)
+                    if args.save_peak_lora and args.use_lora:
+                        peak_lora_snapshot = snapshot_lora(model)
                 else:
                     steps_at_peak += 1
 
@@ -1110,20 +1154,40 @@ def main():
             # ---- Iterative reference update ----
             # Mode 1: peak-triggered (preferred). Only merges when policy is
             #         provably better than last merge baseline AND has plateaued.
-            # Mode 2: fixed interval (legacy, unsafe — can ratchet reward down).
+            # Mode 2: KL emergency trigger. Force merge if raw KL exceeds threshold
+            #         (indicates runaway drift — restore peak snapshot if available).
+            # Mode 3: fixed interval (legacy, unsafe — can ratchet reward down).
             should_merge = False
             merge_reason = ""
+            use_peak_snapshot = False
+
+            # Compute raw KL for emergency trigger check
+            raw_kl = total_kl_loss / max(kl_coef, 1e-8) if total_kl_loss > 0 else 0.0
+
             if args.merge_cooldown > 0 and ref_reward_ema is not None:
                 cooldown_ok = steps_since_merge >= args.merge_cooldown
                 gain_ok = (peak_since_merge - ref_reward_ema) >= args.merge_min_gain
                 patience_ok = steps_at_peak >= args.merge_patience
+                # Normal peak-triggered merge
                 if cooldown_ok and gain_ok and patience_ok:
                     should_merge = True
+                    use_peak_snapshot = (peak_lora_snapshot is not None)
                     merge_reason = (
                         f"peak={peak_since_merge:.4f} ref={ref_reward_ema:.4f} "
                         f"gain={peak_since_merge-ref_reward_ema:+.4f} "
-                        f"steps_at_peak={steps_at_peak} "
-                        f"steps_since_merge={steps_since_merge}"
+                        f"steps_at_peak={steps_at_peak}"
+                    )
+                # KL emergency — overrides normal check, forces merge to salvage
+                elif (args.merge_kl_threshold > 0
+                      and raw_kl > args.merge_kl_threshold
+                      and cooldown_ok
+                      and gain_ok
+                      and peak_lora_snapshot is not None):
+                    should_merge = True
+                    use_peak_snapshot = True
+                    merge_reason = (
+                        f"KL EMERGENCY: raw_kl={raw_kl:.3f} > threshold={args.merge_kl_threshold} "
+                        f"— restoring peak snapshot (peak={peak_since_merge:.4f})"
                     )
             elif args.ref_update_every > 0 and (global_step + 1) % args.ref_update_every == 0:
                 should_merge = True
@@ -1131,6 +1195,11 @@ def main():
 
             if should_merge:
                 print(f"  [MERGE] step={global_step+1}  {merge_reason}", flush=True)
+                # If we have a peak snapshot, restore it before merging (so the
+                # base_weight captures the PEAK policy, not the current degraded one)
+                if use_peak_snapshot and peak_lora_snapshot is not None:
+                    restore_lora(model, peak_lora_snapshot)
+                    print(f"  [MERGE] restored LoRA from peak snapshot", flush=True)
                 # Save full model state BEFORE merge (the policy being captured as new ref)
                 _save_grpo_ckpt(model, optimizer, scaler, global_step + 1, epoch, args,
                                 f"pre_merge_step{global_step+1}", full_state=True)
@@ -1146,6 +1215,7 @@ def main():
                 peak_since_merge = -float('inf')
                 steps_at_peak = 0
                 steps_since_merge = 0
+                peak_lora_snapshot = None   # invalidated after merge
                 print(f"  [MERGE] done. new ref_reward={ref_reward_ema:.4f}  merge_count={merge_count}", flush=True)
 
             # ---- Cleanup ----
