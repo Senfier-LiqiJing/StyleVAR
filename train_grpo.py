@@ -1177,11 +1177,12 @@ def main():
                         f"gain={peak_since_merge-ref_reward_ema:+.4f} "
                         f"steps_at_peak={steps_at_peak}"
                     )
-                # KL emergency — overrides normal check, forces merge to salvage
+                # KL emergency — overrides normal check, forces merge to salvage.
+                # Does NOT require gain_ok: whole point is to rescue even when
+                # model never improved (e.g. after resuming from a drifted ckpt).
                 elif (args.merge_kl_threshold > 0
                       and raw_kl > args.merge_kl_threshold
                       and cooldown_ok
-                      and gain_ok
                       and peak_lora_snapshot is not None):
                     should_merge = True
                     use_peak_snapshot = True
