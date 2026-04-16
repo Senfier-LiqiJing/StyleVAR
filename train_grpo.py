@@ -95,6 +95,10 @@ def parse_args():
                     help="Use DreamSim(gen, target) as the sole reward (requires --paired_data)")
     p.add_argument("--dreamsim_scale", type=float, default=5.0,
                     help="Multiplier on -dreamsim distance for advantage scale")
+    # PANW (Per-Action Normalization Weighting)
+    p.add_argument("--panw_alpha",   type=float, default=0.0,
+                    help="PANW decay exponent (0=disabled). Weight per scale = 1/(h*w)^alpha. "
+                         "Paper uses 0.6-0.8. Upweights coarse scales, downweights fine scales.")
     # training
     p.add_argument("--epochs",       type=int,   default=5)
     p.add_argument("--batch_size",   type=int,   default=6,     help="Condition pairs per step")
@@ -741,6 +745,23 @@ def compute_rewards(
     return total, r_content, r_style, r_tv, r_ssim
 
 
+def build_panw_weights(patch_nums: tuple, alpha: float, device: torch.device) -> torch.Tensor:
+    """Build PANW per-token weight vector.
+
+    For each scale t with grid size (pn × pn), all tokens get weight 1/(pn²)^α.
+    Returns (1, L) tensor where L = sum(pn² for pn in patch_nums) = 680.
+    Weights are normalized so they sum to 1 (making weighted mean easy).
+    """
+    weights = []
+    for pn in patch_nums:
+        num_tokens = pn * pn
+        w = 1.0 / (num_tokens ** alpha)
+        weights.extend([w] * num_tokens)
+    w = torch.tensor(weights, device=device, dtype=torch.float32)
+    w = w / w.sum()  # normalize so weighted mean = (loss * w).sum()
+    return w.unsqueeze(0)  # (1, L)
+
+
 def compute_group_advantages(rewards: torch.Tensor, G: int) -> torch.Tensor:
     """Group-relative advantage: A_i = (R_i - mu) / (sigma + eps).
     rewards layout: [g0_b0, ..., g0_bB, g1_b0, ..., g1_bB, ...] shape (B*G,)
@@ -866,6 +887,15 @@ def main():
         tv_reward_fn = TVReward().to(DEV)
         ssim_reward_fn = SSIMReward().to(DEV)
         print(f"[GRPO] Legacy reward models (LPIPS+Gram+SSIM+TV) loaded on {DEV}")
+
+    # ---- PANW weights ----
+    panw_weights = None
+    if args.panw_alpha > 0:
+        patch_nums = tuple(int(x) for x in "1_2_3_4_5_6_8_10_13_16".split("_"))
+        panw_weights = build_panw_weights(patch_nums, args.panw_alpha, DEV)
+        print(f"[PANW] alpha={args.panw_alpha}, weights per scale: "
+              + ", ".join(f"{pn}x{pn}={panw_weights[0, sum(p**2 for p in patch_nums[:i])].item():.4f}"
+                          for i, pn in enumerate(patch_nums)))
 
     # ---- 3. Optimizer ----
     optimizer = torch.optim.AdamW(train_params, lr=args.lr,
@@ -1119,11 +1149,19 @@ def main():
                 surr1 = ratio * adv_exp
                 surr2 = torch.clamp(ratio, 1.0 - args.clip_eps,
                                     1.0 + args.clip_eps) * adv_exp
-                policy_loss = -torch.min(surr1, surr2).mean()
+                per_token_policy = -torch.min(surr1, surr2)   # (B, L)
 
                 # Non-negative KL estimator (Schulman): (ratio - 1) - log(ratio) >= 0
                 log_ratio_kl = (new_lp.float() - ref_lp.float()).clamp(-10, 10)
-                kl_loss = kl_coef * (torch.exp(log_ratio_kl) - 1 - log_ratio_kl).mean()
+                per_token_kl = kl_coef * (torch.exp(log_ratio_kl) - 1 - log_ratio_kl)  # (B, L)
+
+                # PANW: weighted mean over tokens (upweights coarse scales)
+                if panw_weights is not None:
+                    policy_loss = (per_token_policy * panw_weights).sum(dim=1).mean()
+                    kl_loss = (per_token_kl * panw_weights).sum(dim=1).mean()
+                else:
+                    policy_loss = per_token_policy.mean()
+                    kl_loss = per_token_kl.mean()
 
                 loss = (policy_loss + kl_loss) / args.G
 
