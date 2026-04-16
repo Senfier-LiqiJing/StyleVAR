@@ -79,18 +79,35 @@ class DreamSimMetric(nn.Module):
 
 
 class CLIPMetric(nn.Module):
-    """1 - cosine similarity (distance), higher = less similar."""
-    def __init__(self, device):
+    """1 - cosine similarity (distance), higher = less similar.
+
+    Load priority (avoids open_clip's blocked OpenAI CDN):
+      1. local HF snapshot (--clip_local_dir)
+      2. HF hub (uses HF_ENDPOINT=https://hf-mirror.com if set)
+      3. open_clip fallback
+    """
+    def __init__(self, device, local_dir: str = ""):
         super().__init__()
-        try:
+        self.backend = None
+        if local_dir and os.path.isdir(local_dir):
+            from transformers import CLIPModel
+            self.model = CLIPModel.from_pretrained(local_dir).to(device).eval()
+            self.backend = f"hf-local:{local_dir}"
+        if self.backend is None:
+            try:
+                from transformers import CLIPModel
+                self.model = CLIPModel.from_pretrained(
+                    "openai/clip-vit-base-patch32").to(device).eval()
+                self.backend = "hf-hub"
+            except Exception as e:
+                print(f"[CLIP] HF hub failed: {e}")
+        if self.backend is None:
             import open_clip
-            model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+            model, _, _ = open_clip.create_model_and_transforms(
+                "ViT-B-32", pretrained="openai")
             self.model = model.to(device).eval()
             self.backend = "open_clip"
-        except Exception:
-            from transformers import CLIPModel
-            self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
-            self.backend = "hf"
+        print(f"[CLIP] loaded via backend={self.backend}")
         for p in self.parameters(): p.requires_grad_(False)
         self.register_buffer("mean", torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
         self.register_buffer("std",  torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
@@ -227,7 +244,7 @@ def run_pilot(args):
     print("[Metrics] building DreamSim / CLIP / LPIPS / VGG-Gram ...")
     metrics = {
         "DreamSim": DreamSimMetric(device),
-        "CLIP":     CLIPMetric(device),
+        "CLIP":     CLIPMetric(device, local_dir=args.clip_local_dir),
         "LPIPS":    LPIPSMetric(device),
     }
 
@@ -344,6 +361,9 @@ def parse_args():
     p.add_argument("--seed",       type=int, default=42)
     p.add_argument("--also_composite", action="store_true",
                    help="Also test alpha * DreamSim(cand,content) + (1-alpha) * VGGGram(cand, style) proxy")
+    p.add_argument("--clip_local_dir", type=str, default="",
+                   help="Local HF snapshot of openai/clip-vit-base-patch32 "
+                        "(recommended in China to skip blocked OpenAI CDN)")
     return p.parse_args()
 
 

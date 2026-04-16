@@ -253,18 +253,38 @@ class LPIPSWrap(nn.Module):
 
 
 class CLIPWrap(nn.Module):
-    """Image-image cosine similarity using CLIP ViT-B/32."""
-    def __init__(self, device):
+    """Image-image cosine similarity using CLIP ViT-B/32.
+
+    Loads in this priority order (to avoid open_clip's blocked OpenAI CDN):
+      1. --clip_local_dir  (offline, e.g. a snapshot of openai/clip-vit-base-patch32)
+      2. HuggingFace transformers CLIPModel  (respects HF_ENDPOINT mirror env var)
+      3. open_clip  (last resort — usually blocked in mainland China)
+    """
+    def __init__(self, device, local_dir: str = ""):
         super().__init__()
-        try:
+        self.backend = None
+        # Try local HF snapshot first
+        if local_dir and os.path.isdir(local_dir):
+            from transformers import CLIPModel
+            self.model = CLIPModel.from_pretrained(local_dir).to(device).eval()
+            self.backend = f"hf-local:{local_dir}"
+        # Then HF hub (uses HF_ENDPOINT=https://hf-mirror.com if set)
+        if self.backend is None:
+            try:
+                from transformers import CLIPModel
+                self.model = CLIPModel.from_pretrained(
+                    "openai/clip-vit-base-patch32").to(device).eval()
+                self.backend = "hf-hub"
+            except Exception as e:
+                print(f"[CLIP] HF hub failed: {e}")
+        # Last resort: open_clip
+        if self.backend is None:
             import open_clip
-            model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+            model, _, _ = open_clip.create_model_and_transforms(
+                "ViT-B-32", pretrained="openai")
             self.model = model.to(device).eval()
             self.backend = "open_clip"
-        except Exception:
-            from transformers import CLIPModel
-            self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
-            self.backend = "hf"
+        print(f"[CLIP] loaded via backend={self.backend}")
         for p in self.parameters(): p.requires_grad_(False)
         mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
         std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
@@ -432,7 +452,8 @@ def run_pilot(args):
     print("[Rewards] building...")
     rewards["LPIPS"]     = LPIPSWrap(device).to(device);     reward_ref["LPIPS"]     = "content"
     try:
-        rewards["CLIP"]  = CLIPWrap(device).to(device);      reward_ref["CLIP"]      = "content"
+        rewards["CLIP"]  = CLIPWrap(device, local_dir=args.clip_local_dir).to(device)
+        reward_ref["CLIP"] = "content"
     except Exception as e:
         print(f"[Rewards] CLIP unavailable: {e}")
     try:
@@ -553,6 +574,9 @@ def parse_args():
     p.add_argument("--num_batches", type=int, default=8)
     p.add_argument("--out_dir",    type=str, default="pilot_results")
     p.add_argument("--seed",       type=int, default=42)
+    p.add_argument("--clip_local_dir", type=str, default="",
+                   help="Local HF snapshot of openai/clip-vit-base-patch32 "
+                        "(recommended in China to skip blocked OpenAI CDN)")
     return p.parse_args()
 
 
