@@ -111,6 +111,7 @@ class CLIPMetric(nn.Module):
         for p in self.parameters(): p.requires_grad_(False)
         self.register_buffer("mean", torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1))
         self.register_buffer("std",  torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1))
+        self.to(device)   # move buffers to match model
 
     @torch.no_grad()
     def _encode(self, img_01):
@@ -119,15 +120,10 @@ class CLIPMetric(nn.Module):
         if self.backend == "open_clip":
             f = self.model.encode_image(x)
         else:
-            out = self.model.get_image_features(pixel_values=x)
-            if isinstance(out, torch.Tensor):
-                f = out
-            elif hasattr(out, "image_embeds"):
-                f = out.image_embeds
-            elif hasattr(out, "pooler_output"):
-                f = self.model.visual_projection(out.pooler_output)
-            else:
-                raise RuntimeError(f"Unexpected CLIP output type: {type(out)}")
+            vision_out = self.model.vision_model(pixel_values=x)
+            pooled = (vision_out.pooler_output if hasattr(vision_out, "pooler_output")
+                      else vision_out[1])
+            f = self.model.visual_projection(pooled)
         return F.normalize(f.float(), dim=-1)
 
     @torch.no_grad()
@@ -161,9 +157,9 @@ class VGGGramMetric(nn.Module):
             self.slices.append(nn.Sequential(*list(vgg.children())[prev:idx]))
             prev = idx
         for p in self.parameters(): p.requires_grad_(False)
-        self.to(device).eval()
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        self.to(device).eval()   # after buffers so they move too
 
     @staticmethod
     def _gram(x):
