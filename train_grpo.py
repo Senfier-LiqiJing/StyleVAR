@@ -95,6 +95,14 @@ def parse_args():
                     help="Use DreamSim(gen, target) as the sole reward (requires --paired_data)")
     p.add_argument("--dreamsim_scale", type=float, default=5.0,
                     help="Multiplier on -dreamsim distance for advantage scale")
+    # CLIP reward (when --paired_data) — pilot 2 showed it ranks better than DreamSim
+    p.add_argument("--use_clip_reward", action="store_true",
+                    help="Use CLIP(gen, target) cosine similarity as the sole reward "
+                         "(requires --paired_data). Mutually exclusive with --use_dreamsim.")
+    p.add_argument("--clip_scale", type=float, default=5.0,
+                    help="Multiplier on CLIP cosine similarity for advantage scale")
+    p.add_argument("--clip_local_dir", type=str, default="",
+                    help="Local HF snapshot of openai/clip-vit-base-patch32 (recommended to skip HF downloads)")
     # PANW (Per-Action Normalization Weighting)
     p.add_argument("--panw_alpha",   type=float, default=0.0,
                     help="PANW decay exponent (0=disabled). Weight per scale = 1/(h*w)^alpha. "
@@ -495,6 +503,67 @@ class DreamSimReward(nn.Module):
         return -dist
 
 
+class CLIPReward(nn.Module):
+    """CLIP image-image cosine similarity reward.
+
+    Returns cosine similarity in [-1, 1], higher = more similar. Use against
+    the paired-data target (GT stylized output) for a semantic, stylization-robust
+    reward signal. Pilot 2 showed CLIP(out, content) tracks CLIP(out, GT) with
+    Spearman rho ~0.8 — much higher than DreamSim (0.64), making CLIP a more
+    stable ranking metric for style-transfer candidates.
+
+    Load priority: local HF snapshot > HF hub > open_clip.
+    """
+    def __init__(self, device: torch.device, local_dir: str = ""):
+        super().__init__()
+        self.backend = None
+        if local_dir and os.path.isdir(local_dir):
+            from transformers import CLIPModel
+            self.model = CLIPModel.from_pretrained(local_dir).to(device).eval()
+            self.backend = f"hf-local:{local_dir}"
+        if self.backend is None:
+            try:
+                from transformers import CLIPModel
+                self.model = CLIPModel.from_pretrained(
+                    "openai/clip-vit-base-patch32").to(device).eval()
+                self.backend = "hf-hub"
+            except Exception as e:
+                print(f"[CLIPReward] HF hub failed: {e}")
+        if self.backend is None:
+            import open_clip
+            model, _, _ = open_clip.create_model_and_transforms(
+                "ViT-B-32", pretrained="openai")
+            self.model = model.to(device).eval()
+            self.backend = "open_clip"
+        print(f"[CLIPReward] backend={self.backend}")
+        for p in self.parameters(): p.requires_grad_(False)
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        std  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+        self.to(device)
+
+    @torch.no_grad()
+    def _encode(self, img_01: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(img_01, size=224, mode="bilinear", align_corners=False)
+        x = (x - self.mean) / self.std
+        if self.backend == "open_clip":
+            feat = self.model.encode_image(x)
+        else:
+            vision_out = self.model.vision_model(pixel_values=x)
+            pooled = (vision_out.pooler_output if hasattr(vision_out, "pooler_output")
+                      else vision_out[1])
+            feat = self.model.visual_projection(pooled)
+        return F.normalize(feat.float(), dim=-1)
+
+    @torch.no_grad()
+    def forward(self, gen_01: torch.Tensor, target_01: torch.Tensor) -> torch.Tensor:
+        """gen_01, target_01: (B,3,H,W) in [0,1]. Returns (B,) cosine in [-1,1]."""
+        fg = self._encode(gen_01)
+        ft = self._encode(target_01)
+        return (fg * ft).sum(dim=-1)
+
+
 # ======================== Model Building ===================================
 
 def _build_model(args):
@@ -876,11 +945,18 @@ def main():
 
     # ---- 2. Reward models ----
     dreamsim_net = None
+    clip_net = None
     lpips_net = vgg_gram = tv_reward_fn = ssim_reward_fn = None
+    assert not (args.use_dreamsim and args.use_clip_reward), \
+        "Cannot enable both --use_dreamsim and --use_clip_reward; pick one."
     if args.use_dreamsim:
         assert args.paired_data, "--use_dreamsim requires --paired_data"
         dreamsim_net = DreamSimReward(device=DEV)
         print(f"[GRPO] DreamSim reward loaded on {DEV}")
+    elif args.use_clip_reward:
+        assert args.paired_data, "--use_clip_reward requires --paired_data"
+        clip_net = CLIPReward(device=DEV, local_dir=args.clip_local_dir)
+        print(f"[GRPO] CLIP reward loaded on {DEV}")
     else:
         lpips_net = _load_lpips_alex(DEV)
         vgg_gram  = VGGGramStyleReward().to(DEV)
@@ -1052,6 +1128,7 @@ def main():
             content_01 = (content_dev + 1) * 0.5
 
             r_dream_mean = 0.0  # unscaled raw -dreamsim distance (for logging)
+            r_clip_mean  = 0.0  # unscaled raw CLIP cosine similarity (for logging)
             if args.use_dreamsim:
                 # DreamSim(gen, target) as sole reward
                 target_01 = (target_dev + 1) * 0.5
@@ -1059,6 +1136,15 @@ def main():
                 r_dream = dreamsim_net(gen_images_01, target_exp)  # (B*G,) in [-1, 0]
                 rewards = r_dream * args.dreamsim_scale
                 r_dream_mean = r_dream.mean().item()  # raw, unscaled
+                r_content = r_style = r_tv = r_ssim = torch.zeros_like(rewards)
+                del target_exp, target_01
+            elif args.use_clip_reward:
+                # CLIP(gen, target) cosine similarity as sole reward
+                target_01 = (target_dev + 1) * 0.5
+                target_exp = target_01.repeat(args.G, 1, 1, 1)
+                r_clip = clip_net(gen_images_01, target_exp)  # (B*G,) in [-1, 1]
+                rewards = r_clip * args.clip_scale
+                r_clip_mean = r_clip.mean().item()
                 r_content = r_style = r_tv = r_ssim = torch.zeros_like(rewards)
                 del target_exp, target_01
             else:
@@ -1271,6 +1357,8 @@ def main():
                 mem = torch.cuda.max_memory_allocated(DEV) / 1e9
                 if args.use_dreamsim:
                     reward_detail = f"[dream={r_dream_mean:.4f}]"
+                elif args.use_clip_reward:
+                    reward_detail = f"[clip_sim={r_clip_mean:.4f}]"
                 else:
                     reward_detail = (f"[c={r_content_mean:.4f} s={r_style_mean:.4f} "
                                      f"ssim={r_ssim_mean:.4f} tv={r_tv_mean:.4f}]")
@@ -1305,6 +1393,8 @@ def main():
                     }
                     if args.use_dreamsim:
                         wandb_log["reward/dreamsim (neg distance)"] = r_dream_mean
+                    elif args.use_clip_reward:
+                        wandb_log["reward/clip_sim (cosine)"] = r_clip_mean
                     else:
                         wandb_log["reward/content (neg LPIPS)"] = r_content_mean
                         wandb_log["reward/style (neg Gram)"] = r_style_mean

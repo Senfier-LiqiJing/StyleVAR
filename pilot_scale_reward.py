@@ -55,6 +55,19 @@ if ROOT not in sys.path:
 from models import build_vae_stylevar, VQVAE, StyleVAR
 
 
+# ---------------------------------------------------------------------------
+# Monkey-patch models.quant.Phi.forward to be non-in-place (autograd-safe).
+# The original uses `.mul_()` on its conv output; although that tensor isn't
+# typically saved for backward, when combined with the rest of the graph in a
+# soft rollout it can trigger version-mismatch errors. Replace with pure
+# functional ops so gradients through the rollout work reliably.
+# ---------------------------------------------------------------------------
+from models.quant import Phi as _Phi
+def _phi_forward_noinplace(self, h_BChw):
+    return h_BChw * (1.0 - self.resi_ratio) + nn.Conv2d.forward(self, h_BChw) * self.resi_ratio
+_Phi.forward = _phi_forward_noinplace
+
+
 # =========================== Dataset =======================================
 class UnpairedPairDataset(Dataset):
     EXTS = ("*.jpg", "*.jpeg", "*.png", "*.webp",
@@ -582,12 +595,17 @@ def parse_args():
     p.add_argument("--clip_local_dir", type=str, default="",
                    help="Local HF snapshot of openai/clip-vit-base-patch32 "
                         "(recommended in China to skip blocked OpenAI CDN)")
+    p.add_argument("--detect_anomaly", action="store_true",
+                   help="Enable torch.autograd.set_detect_anomaly for debugging in-place issues")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     random.seed(args.seed); torch.manual_seed(args.seed); np.random.seed(args.seed)
+    if args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+        print("[debug] torch.autograd.set_detect_anomaly(True) enabled — backward will be slower")
     run_pilot(args)
 
 
