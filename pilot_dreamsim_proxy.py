@@ -119,7 +119,15 @@ class CLIPMetric(nn.Module):
         if self.backend == "open_clip":
             f = self.model.encode_image(x)
         else:
-            f = self.model.get_image_features(pixel_values=x)
+            out = self.model.get_image_features(pixel_values=x)
+            if isinstance(out, torch.Tensor):
+                f = out
+            elif hasattr(out, "image_embeds"):
+                f = out.image_embeds
+            elif hasattr(out, "pooler_output"):
+                f = self.model.visual_projection(out.pooler_output)
+            else:
+                raise RuntimeError(f"Unexpected CLIP output type: {type(out)}")
         return F.normalize(f.float(), dim=-1)
 
     @torch.no_grad()

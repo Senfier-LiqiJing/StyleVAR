@@ -296,7 +296,16 @@ class CLIPWrap(nn.Module):
         if self.backend == "open_clip":
             feat = self.model.encode_image(x)
         else:
-            feat = self.model.get_image_features(pixel_values=x)
+            out = self.model.get_image_features(pixel_values=x)
+            if isinstance(out, torch.Tensor):
+                feat = out
+            elif hasattr(out, "image_embeds"):
+                feat = out.image_embeds
+            elif hasattr(out, "pooler_output"):
+                # Some transformers versions return vision-model output here.
+                feat = self.model.visual_projection(out.pooler_output)
+            else:
+                raise RuntimeError(f"Unexpected CLIP output type: {type(out)}")
         return F.normalize(feat.float(), dim=-1)
 
     def forward(self, gen_01, ref_01):
