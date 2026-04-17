@@ -65,8 +65,9 @@ def apply_lora(model, rank, alpha):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--grpo_ckpt", type=str, required=True, help="Path to GRPO checkpoint")
-    p.add_argument("--sft_ckpt", type=str, default="Output/ar-ckpt-best.pth")
+    p.add_argument("--grpo_ckpt", type=str, default="",
+                   help="Path to GRPO LoRA checkpoint (optional when --sft_only)")
+    p.add_argument("--sft_ckpt", type=str, default="Output_v2/ar-ckpt-best.pth")
     p.add_argument("--vae_ckpt", type=str, default="ckpt/vae_ch160v4096z32.pth")
     p.add_argument("--sft_only", action="store_true", help="Generate with SFT model only (no LoRA)")
     p.add_argument("--num", type=int, default=8)
@@ -141,6 +142,7 @@ def main():
     print(f"[SFT] Loaded from {sft_path}")
 
     if not args.sft_only:
+        assert args.grpo_ckpt, "--grpo_ckpt is required unless --sft_only is set"
         # ---- Load GRPO LoRA ----
         grpo_ckpt = torch.load(args.grpo_ckpt, map_location="cpu")
         grpo_args = grpo_ckpt.get("args", {})

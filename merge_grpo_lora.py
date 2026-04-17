@@ -80,6 +80,42 @@ def extract_sft_state(sft_ckpt):
     return sft_ckpt
 
 
+def bake_lora_into_plain(state: dict, rank: int, alpha: float) -> dict:
+    """If `state` has LoRA wrapper keys (base_weight / lora_A / lora_B), bake
+    the LoRA delta into base_weight and return a plain state_dict (weight/bias).
+
+    No-op if no LoRA keys are present.
+    """
+    scaling = alpha / rank
+    lora_prefixes = {k[:-len(".lora_A")] for k in state.keys() if k.endswith(".lora_A")}
+    if not lora_prefixes:
+        return state  # plain already
+    out = {}
+    n_merged = 0
+    for k, v in state.items():
+        matched = False
+        for p in lora_prefixes:
+            if k == p + ".base_weight":
+                lA = state[p + ".lora_A"]
+                lB = state[p + ".lora_B"]
+                out[p + ".weight"] = (v + (lB @ lA) * scaling).contiguous()
+                n_merged += 1
+                matched = True
+                break
+            if k == p + ".base_bias":
+                out[p + ".bias"] = v
+                matched = True
+                break
+            if k == p + ".lora_A" or k == p + ".lora_B":
+                matched = True
+                break
+        if not matched:
+            out[k] = v
+    print(f"[merge] pre-processing: baked {n_merged} LoRA-wrapped modules "
+          f"(rank={rank} alpha={alpha} scaling={scaling}) into plain weights")
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sft_ckpt",  required=True,
@@ -113,6 +149,12 @@ def main():
     sft_raw = torch.load(os.path.join(ROOT, args.sft_ckpt) if not os.path.isabs(args.sft_ckpt)
                          else args.sft_ckpt, map_location="cpu")
     sft_state = extract_sft_state(sft_raw)
+    # If the "SFT" ckpt is itself LoRA-wrapped (e.g. a prior GRPO full_state save
+    # like grpo_output_v2/grpo_best.pth), bake its LoRA into base_weight first.
+    if any(k.endswith(".lora_A") for k in sft_state.keys()):
+        sft_rank  = (sft_raw.get("args", {}) if isinstance(sft_raw, dict) else {}).get("lora_rank", 256)
+        sft_alpha = (sft_raw.get("args", {}) if isinstance(sft_raw, dict) else {}).get("lora_alpha", 512.0)
+        sft_state = bake_lora_into_plain(sft_state, sft_rank, sft_alpha)
     model.load_state_dict(sft_state, strict=True)
     print(f"[merge] SFT base loaded: {args.sft_ckpt}  ({len(sft_state)} tensors)")
 
