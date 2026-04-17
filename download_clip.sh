@@ -12,10 +12,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_DIR="${1:-${SCRIPT_DIR}/ckpt/clip-vit-base-patch32}"
 
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"  # off by default
 
-echo "[download_clip] HF_ENDPOINT=${HF_ENDPOINT}"
 echo "[download_clip] OUT_DIR=${OUT_DIR}"
 
 mkdir -p "${OUT_DIR}"
