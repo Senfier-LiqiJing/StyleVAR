@@ -15,8 +15,8 @@
 #   - merge_kl_threshold=2.0: emergency merge if KL runs away
 #
 # Usage:
-#   bash run_grpo_v5.sh                                    # starts from ckpt/grpo-best.pth (v2+v3 merged)
-#   bash run_grpo_v5.sh --var_ckpt ckpt/sft-best.pth       # start fresh from raw SFT instead
+#   bash run_grpo_v5.sh                                    # starts from ckpt/sft-best.pth (fresh GRPO)
+#   bash run_grpo_v5.sh --var_ckpt ckpt/grpo-best.pth      # continue from v2+v3 merged base instead
 #   bash run_grpo_v5.sh --resume path/to/grpo_ckpt.pth     # resume v5
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -33,7 +33,7 @@ nohup python -u "${SCRIPT_DIR}/train_grpo.py" \
     --old_data_path "${SCRIPT_DIR}/data/OmniStyle-150k" \
     --new_data_path "${SCRIPT_DIR}/data/ImagePulse" \
     --vae_ckpt "${SCRIPT_DIR}/ckpt/vae_ch160v4096z32.pth" \
-    --var_ckpt "${SCRIPT_DIR}/ckpt/grpo-best.pth" \
+    --var_ckpt "${SCRIPT_DIR}/ckpt/sft-best.pth" \
     --out_dir "${OUTPUT_DIR}" \
     --use_lora --lora_rank 256 --lora_alpha 512 \
     --G 16 --batch_size 16 \

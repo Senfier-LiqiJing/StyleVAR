@@ -72,6 +72,12 @@ def parse_args():
     p.add_argument("--kl_coef",      type=float, default=0.01,  help="Initial KL penalty coefficient beta")
     p.add_argument("--kl_target",    type=float, default=0.2,   help="Target per-step raw KL for adaptive coefficient (0=fixed)")
     p.add_argument("--clip_eps",     type=float, default=0.2,   help="PPO-style clipping epsilon")
+    p.add_argument("--log_ratio_clamp", type=float, default=10.0,
+                    help="Clamp on |log(new_lp - old_lp)| before exp to prevent ratio explosion")
+    p.add_argument("--kl_spike_threshold", type=float, default=5.0,
+                    help="Per-G raw KL (kl_loss/kl_coef) above this skips the backward to prevent weight corruption")
+    p.add_argument("--seed",         type=int,   default=42,
+                    help="Global RNG seed (torch/np/random + per-step rollout seeds). Reproducible runs.")
     p.add_argument("--ref_update_every", type=int, default=0,
                     help="[LEGACY] Merge LoRA every N steps (0=disabled, use peak-triggered instead)")
     # Peak-triggered iterative merge (preferred over ref_update_every)
@@ -597,12 +603,77 @@ def _build_model(args):
             st = ckpt["model"]
         else:
             st = ckpt
-        model.load_state_dict(st, strict=False)
+
+        # Safely load: STRICT first, then auto-bake LoRA wrappers if present.
+        # DO NOT fall back to strict=False silently — that hid a major bug (v3
+        # trained on random-init transformer blocks because v2 ckpt keys were
+        # LoRA-wrapped and silently dropped).
+        _load_var_state_strict(model, st, ckpt if isinstance(ckpt, dict) else {})
         print(f"[GRPO] StyleVAR loaded from {args.var_ckpt}")
     else:
         print("[GRPO] WARNING: No VAR checkpoint — training from scratch init")
 
     return model, vae, patch_nums
+
+
+def _load_var_state_strict(model, st: dict, full_ckpt: dict):
+    """Load a StyleVAR state_dict with strict=True, auto-baking LoRA wrappers.
+
+    Handles three cases (all verified to be strict-equivalent after handling):
+      1. Plain SFT state_dict (`blocks.X.*.weight`)  → strict=True directly.
+      2. LoRA-wrapped full_state (has `.base_weight` / `.lora_A` / `.lora_B`)
+         → bake delta into `.weight`, strip LoRA, then strict=True.
+      3. LoRA-only state_dict (only `.lora_A` / `.lora_B`)
+         → raise — this isn't a valid base-model ckpt.
+
+    Any unexpected or missing keys after handling raise a RuntimeError.
+    """
+    has_base_weight = any(k.endswith(".base_weight") for k in st.keys())
+    has_lora_A      = any(k.endswith(".lora_A")      for k in st.keys())
+    has_plain_weight = any(
+        k.endswith(".weight") and not (k.endswith(".base_weight")
+                                       or ".lora_" in k)
+        for k in st.keys()
+    )
+
+    # Case 3: only LoRA keys, no base → unusable as a base ckpt.
+    if has_lora_A and not has_base_weight:
+        raise RuntimeError(
+            "[load_var] Refused: ckpt contains only LoRA-only keys "
+            "(no base_weight / weight for transformer blocks). "
+            "This would silently train on random-init transformer. "
+            "Provide a full-state or plain-SFT ckpt, or merge the LoRA first."
+        )
+
+    # Case 2: LoRA-wrapped full_state → bake LoRA into plain weights.
+    if has_base_weight:
+        args_in_ckpt = full_ckpt.get("args", {}) if isinstance(full_ckpt, dict) else {}
+        rank  = args_in_ckpt.get("lora_rank", 256)
+        alpha = args_in_ckpt.get("lora_alpha", 512.0)
+        scaling = alpha / rank
+        print(f"[load_var] Detected LoRA-wrapped ckpt; baking delta "
+              f"(rank={rank}, alpha={alpha}, scaling={scaling}) into plain weights.")
+        prefixes = {k[:-len(".lora_A")] for k in st.keys() if k.endswith(".lora_A")}
+        baked = {}
+        n_baked = 0
+        for k, v in st.items():
+            matched = False
+            for p in prefixes:
+                if k == p + ".base_weight":
+                    lA = st[p + ".lora_A"]; lB = st[p + ".lora_B"]
+                    baked[p + ".weight"] = (v + (lB @ lA) * scaling).contiguous()
+                    n_baked += 1; matched = True; break
+                if k == p + ".base_bias":
+                    baked[p + ".bias"] = v; matched = True; break
+                if k == p + ".lora_A" or k == p + ".lora_B":
+                    matched = True; break
+            if not matched:
+                baked[k] = v
+        print(f"[load_var] Baked {n_baked} LoRA modules into plain weights.")
+        st = baked
+
+    # Strict load — will raise RuntimeError on ANY missing / unexpected key.
+    model.load_state_dict(st, strict=True)
 
 
 # ======================== Rollout (Autoregressive Sampling) ================
@@ -617,6 +688,7 @@ def rollout_generate(
     temperature: float = 1.0,
     top_k: int = 900,
     top_p: float = 0.96,
+    base_seed: int = None,      # if set: rollout g uses base_seed + g (reproducible)
 ) -> Tuple[List[List[torch.LongTensor]], torch.Tensor]:
     """
     Generate G rollouts per condition pair (no CFG).
@@ -661,7 +733,10 @@ def rollout_generate(
 
     for g_idx in range(G):
         rng = torch.Generator(device=DEV)
-        rng.manual_seed(int(time.time() * 1000 + g_idx) % (2**31))
+        if base_seed is None:
+            rng.manual_seed(int(time.time() * 1000 + g_idx) % (2**31))
+        else:
+            rng.manual_seed((int(base_seed) + g_idx) % (2**31))
 
         # Init next_token_map from SOS
         next_token_map = (
@@ -901,6 +976,14 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # ---- Global RNG seeding (reproducibility) ----
+    random.seed(args.seed)
+    import numpy as _np
+    _np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    print(f"[GRPO] RNG seeded with seed={args.seed}")
+
     DEV = torch.device("cuda:0")
 
     # ---- Resolve SFT checkpoint ----
@@ -1078,10 +1161,14 @@ def main():
             model.eval()
             if args.use_lora:
                 set_lora_enabled(model, True)
+            # Deterministic per-step rollout seed (still varies across steps / g_idx)
+            rollout_base_seed = (args.seed * 1_000_003
+                                  + global_step * args.G) % (2**31)
             token_trajs, gen_images_01 = rollout_generate(
                 model, vae, style_dev, content_dev,
                 G=args.G, temperature=args.temperature,
                 top_k=args.top_k, top_p=args.top_p,
+                base_seed=rollout_base_seed,
             )
 
             # ==============================================================
@@ -1213,7 +1300,11 @@ def main():
                 ref_lp = ref_logprobs[g*B:(g+1)*B].detach()
                 adv    = advantages[g*B:(g+1)*B].detach()
 
-                log_ratio = new_lp.float() - old_lp.float()
+                # Clamp log_ratio before exp to prevent ratio explosion when
+                # new_lp - old_lp is large. PPO clipping only bounds surr2;
+                # surr1 for negative advantages is unclipped and can blow up.
+                log_ratio = (new_lp.float() - old_lp.float()).clamp(
+                    -args.log_ratio_clamp, args.log_ratio_clamp)
                 ratio = torch.exp(log_ratio)
 
                 # Debug: print diagnostics on first 3 steps
@@ -1251,14 +1342,18 @@ def main():
 
                 loss = (policy_loss + kl_loss) / args.G
 
-                # Safety: skip if loss is NaN/Inf OR KL spike to prevent weight corruption
-                kl_spike = kl_loss.item() / args.G > 0.5  # raw KL > 0.5 per step = spike
+                # Safety: skip if loss is NaN/Inf OR KL spike to prevent weight corruption.
+                # kl_loss has kl_coef baked in (per Schulman k3 line above); divide it out
+                # to compare against a scale-invariant threshold on the raw KL estimate.
+                raw_kl_g = kl_loss.item() / max(kl_coef, 1e-8)
+                kl_spike = raw_kl_g > args.kl_spike_threshold
                 if torch.isfinite(loss) and not kl_spike:
                     loss.backward()
                     total_policy_loss += policy_loss.item() / args.G
                     total_kl_loss     += kl_loss.item() / args.G
                 else:
-                    reason = "NaN/Inf" if not torch.isfinite(loss) else f"KL spike ({kl_loss.item()/args.G:.2f})"
+                    reason = ("NaN/Inf" if not torch.isfinite(loss)
+                              else f"KL spike (raw_kl={raw_kl_g:.2f} > {args.kl_spike_threshold})")
                     print(f"  [WARN] Skipping {reason} at g={g}", flush=True)
                     del new_lp, log_ratio, ratio, adv_exp, surr1, surr2
                     del log_ratio_kl, policy_loss, kl_loss, loss
