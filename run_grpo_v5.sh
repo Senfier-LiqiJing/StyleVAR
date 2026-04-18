@@ -25,6 +25,8 @@ OUTPUT_DIR="${SCRIPT_DIR}/grpo_output_v5"
 
 export HF_ENDPOINT=https://hf-mirror.com
 export PYTHONUNBUFFERED=1
+# Reduce CUDA allocator fragmentation (v5 OOM'd at step 600 from 676MB stranded unallocated blocks)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p "${OUTPUT_DIR}"
 

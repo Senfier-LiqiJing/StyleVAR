@@ -82,13 +82,17 @@ def parse_args():
                     help="[LEGACY] Merge LoRA every N steps (0=disabled, use peak-triggered instead)")
     # Peak-triggered iterative merge (preferred over ref_update_every)
     p.add_argument("--merge_cooldown", type=int, default=0,
-                    help="Minimum steps between merges (0=disable peak-triggered merging)")
+                    help="Minimum steps between NORMAL peak-triggered merges (0=disable peak-triggered merging)")
     p.add_argument("--merge_min_gain", type=float, default=0.02,
                     help="Required reward_ema improvement over last-merge baseline")
     p.add_argument("--merge_patience", type=int, default=30,
                     help="Steps to wait at peak before confirming merge trigger")
     p.add_argument("--merge_kl_threshold", type=float, default=0.5,
                     help="Emergency merge if raw KL exceeds this (0=disabled). Catches KL runaway before collapse.")
+    p.add_argument("--merge_emergency_cooldown", type=int, default=50,
+                    help="Minimum steps between EMERGENCY merges (separate from --merge_cooldown). "
+                         "Emergency merges bypass the regular cooldown; this short cooldown just "
+                         "prevents merge-thrashing within the same burst.")
     p.add_argument("--save_peak_lora", action="store_true",
                     help="Snapshot LoRA weights at every new peak; use snapshot for merge instead of current weights.")
     # reward weights (legacy LPIPS+Gram+SSIM path)
@@ -1396,18 +1400,22 @@ def main():
                         f"gain={peak_since_merge-ref_reward_ema:+.4f} "
                         f"steps_at_peak={steps_at_peak}"
                     )
-                # KL emergency — overrides normal check, forces merge to salvage.
+                # KL emergency — BYPASSES the regular cooldown (that's the
+                # whole point of emergency). Uses a separate short cooldown to
+                # prevent merge-thrashing in a single KL burst.
                 # Does NOT require gain_ok: whole point is to rescue even when
                 # model never improved (e.g. after resuming from a drifted ckpt).
                 elif (args.merge_kl_threshold > 0
                       and raw_kl > args.merge_kl_threshold
-                      and cooldown_ok
+                      and steps_since_merge >= args.merge_emergency_cooldown
                       and peak_lora_snapshot is not None):
                     should_merge = True
                     use_peak_snapshot = True
                     merge_reason = (
                         f"KL EMERGENCY: raw_kl={raw_kl:.3f} > threshold={args.merge_kl_threshold} "
-                        f"— restoring peak snapshot (peak={peak_since_merge:.4f})"
+                        f"(steps_since_merge={steps_since_merge} >= emergency_cooldown="
+                        f"{args.merge_emergency_cooldown}) — restoring peak snapshot "
+                        f"(peak={peak_since_merge:.4f})"
                     )
             elif args.ref_update_every > 0 and (global_step + 1) % args.ref_update_every == 0:
                 should_merge = True
