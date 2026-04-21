@@ -56,6 +56,60 @@ if ROOT not in sys.path:
 from models import build_vae_stylevar
 
 
+# =========================== AdaIN baseline ===============================
+class AdaINBaseline(nn.Module):
+    """AdaIN style transfer baseline (Huang & Belongie, 2017).
+    Encoder = VGG19 up to relu4_1; Decoder = mirror architecture (pre-trained).
+
+    Weights `decoder.pth` from https://github.com/naoto0804/pytorch-AdaIN
+    (see bash download_adain.sh).
+    """
+    def __init__(self, device, decoder_path: str):
+        super().__init__()
+        self.device = device
+        vgg = tv_models.vgg19(weights=tv_models.VGG19_Weights.IMAGENET1K_V1).features
+        self.encoder = nn.Sequential(*list(vgg.children())[:21]).to(device).eval()
+        self.decoder = nn.Sequential(
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(512, 256, 3), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(256, 256, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(256, 256, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(256, 256, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(256, 128, 3), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(128, 128, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(128, 64, 3), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(64, 64, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1,1,1,1)), nn.Conv2d(64, 3, 3),
+        ).to(device)
+        self.decoder.load_state_dict(torch.load(decoder_path, map_location=device))
+        self.decoder.eval()
+        for p in self.parameters(): p.requires_grad_(False)
+
+    @staticmethod
+    def _mean_std(feat, eps=1e-5):
+        N, C = feat.shape[:2]
+        var = feat.view(N, C, -1).var(dim=2, unbiased=False) + eps
+        std = var.sqrt().view(N, C, 1, 1)
+        mean = feat.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+        return mean, std
+
+    def _adain(self, c_feat, s_feat):
+        sm, ss = self._mean_std(s_feat)
+        cm, cs = self._mean_std(c_feat)
+        return (c_feat - cm) / cs * ss + sm
+
+    @torch.no_grad()
+    def infer(self, content_01, style_01, alpha: float = 1.0):
+        """content / style: (B, 3, H, W) in [0, 1]. Returns gen in [0, 1]."""
+        c = content_01.to(self.device); s = style_01.to(self.device)
+        c_feat = self.encoder(c); s_feat = self.encoder(s)
+        t = self._adain(c_feat, s_feat)
+        t = alpha * t + (1 - alpha) * c_feat
+        return self.decoder(t).clamp(0, 1)
+
+
 # =========================== Load-safe helpers =============================
 def _bake_lora_into_plain(state: dict, rank: int, alpha: float) -> dict:
     """Mirror of train_grpo.py's bake function. Converts a LoRA-wrapped state
@@ -440,9 +494,11 @@ def _collect_unpaired_cocowiki(content_root: str, style_root: str, n: int, seed:
 
 # =========================== Eval loop =====================================
 @torch.no_grad()
-def evaluate(model, vae, dataset: Dataset, metrics: dict, device,
+def evaluate(generator_fn, dataset: Dataset, metrics: dict, device,
              is_paired: bool, seed: int, top_k=900, top_p=0.96,
-             save_imgs_dir: str = None, dataset_name: str = ""):
+             save_imgs_dir: str = None, dataset_name: str = "",
+             model_name: str = "model"):
+    """generator_fn(c_pm1, s_pm1, i) -> gen_01 in [0,1]. Abstract over StyleVAR / AdaIN / etc."""
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2)
     agg = {k: [] for k in ("style_loss", "content_loss",
                            "lpips_ref", "ssim_ref", "dreamsim_ref", "clip_ref",
@@ -463,14 +519,10 @@ def evaluate(model, vae, dataset: Dataset, metrics: dict, device,
         c_pm1 = c_pm1.to(device); s_pm1 = s_pm1.to(device)
         c_01 = (c_pm1 + 1) * 0.5; s_01 = (s_pm1 + 1) * 0.5
 
-        # Inference
+        # Inference (delegated)
         torch.cuda.synchronize(); t0 = time.time()
-        gen_01 = model.autoregressive_infer(
-            B=1, style_img=s_pm1, content_img=c_pm1,
-            top_k=top_k, top_p=top_p, g_seed=seed + i,
-        )
+        gen_01 = generator_fn(c_pm1, s_pm1, c_01, s_01, i).clamp(0, 1)
         torch.cuda.synchronize(); agg["infer_time_sec"].append(time.time() - t0)
-        gen_01 = gen_01.clamp(0, 1)
 
         # Metrics
         c_loss, s_loss = metrics["vgg"](gen_01, c_01, s_01)
@@ -485,11 +537,11 @@ def evaluate(model, vae, dataset: Dataset, metrics: dict, device,
 
         # Optionally save comparison image
         if save_imgs_dir and i < 8:  # save first 8 of each dataset
-            _save_quad(save_imgs_dir, f"{i:03d}_{str(tag[0])[:40]}.png",
+            _save_quad(save_imgs_dir, f"{i:03d}_{model_name}_{str(tag[0])[:40]}.png",
                        c_01[0], s_01[0], t_01[0] if is_paired else None, gen_01[0])
 
         if (i + 1) % 10 == 0:
-            print(f"  [{dataset_name}] {i+1}/{len(dataset)} done", flush=True)
+            print(f"  [{model_name}/{dataset_name}] {i+1}/{len(dataset)} done", flush=True)
 
     # Summarize
     import statistics as st
@@ -503,6 +555,7 @@ def evaluate(model, vae, dataset: Dataset, metrics: dict, device,
     summary["ref_target"] = agg["ref_target"]
     summary["n_samples"]  = len(agg["content_loss"])
     summary["dataset_name"] = dataset_name
+    summary["model_name"] = model_name
     summary["total_time_sec"] = time.time() - t_start_all
     return summary, agg
 
@@ -552,6 +605,14 @@ def main():
     p.add_argument("--lpips_backbone", type=str, default="vgg", choices=["vgg", "alex", "squeeze"],
                    help="LPIPS backbone. vgg = research default; alex = training-time default (faster)")
 
+    # Baselines
+    p.add_argument("--also_adain", action="store_true",
+                   help="Also evaluate AdaIN as a baseline on the same samples (for comparison)")
+    p.add_argument("--adain_decoder", type=str, default="ckpt/adain_decoder.pth",
+                   help="Path to the AdaIN decoder weights (download via download_adain.sh)")
+    p.add_argument("--skip_stylevar", action="store_true",
+                   help="Skip StyleVAR evaluation (e.g. to eval AdaIN alone)")
+
     # Output
     p.add_argument("--out_dir", type=str, default="eval_out")
     p.add_argument("--save_samples", action="store_true", default=True,
@@ -564,8 +625,21 @@ def main():
     torch.manual_seed(args.seed); random.seed(args.seed)
     print(f"[eval] device={device}  seed={args.seed}")
 
-    # ---- Load model ----
-    model, vae = load_model(args.ckpt, args.vae_ckpt, device, base_ckpt_path=args.base_ckpt)
+    # ---- Load StyleVAR (unless skipped) ----
+    model = None
+    if not args.skip_stylevar:
+        model, vae = load_model(args.ckpt, args.vae_ckpt, device, base_ckpt_path=args.base_ckpt)
+
+    # ---- Optionally load AdaIN baseline ----
+    adain = None
+    if args.also_adain:
+        if not os.path.isfile(args.adain_decoder):
+            print(f"[eval] WARNING: --also_adain set but decoder not found at {args.adain_decoder}")
+            print(f"[eval]          Run `bash download_adain.sh` first, or pass --adain_decoder PATH")
+            print(f"[eval]          Skipping AdaIN.")
+        else:
+            print(f"[eval] loading AdaIN decoder: {args.adain_decoder}")
+            adain = AdaINBaseline(device, args.adain_decoder)
 
     # ---- Build metrics once ----
     print("[eval] building metrics...")
@@ -590,6 +664,23 @@ def main():
          lambda: _collect_unpaired_cocowiki(args.coco_root, args.wikiart_root, args.cocowiki_n, args.seed)),
     ]
 
+    # Generator closures
+    def stylevar_gen(c_pm1, s_pm1, c_01, s_01, i):
+        return model.autoregressive_infer(
+            B=1, style_img=s_pm1, content_img=c_pm1,
+            top_k=args.top_k, top_p=args.top_p, g_seed=args.seed + i,
+        )
+
+    def adain_gen(c_pm1, s_pm1, c_01, s_01, i):
+        return adain.infer(c_01, s_01, alpha=1.0)
+
+    models_to_eval = []
+    if model is not None: models_to_eval.append(("StyleVAR", stylevar_gen))
+    if adain is not None: models_to_eval.append(("AdaIN",    adain_gen))
+    if not models_to_eval:
+        raise RuntimeError("Nothing to evaluate: --skip_stylevar is set and --also_adain "
+                            "either unset or decoder missing.")
+
     for name, n, is_paired, build_fn in dataset_specs:
         if n <= 0:
             print(f"\n[eval] SKIP {name} (n={n})"); continue
@@ -601,12 +692,16 @@ def main():
             continue
         save_dir = os.path.join(args.out_dir, "samples", name.replace("+", "_")) \
                    if args.save_samples else None
-        summary, _raw = evaluate(model, vae, dset, metrics, device,
-                                  is_paired=is_paired, seed=args.seed,
-                                  top_k=args.top_k, top_p=args.top_p,
-                                  save_imgs_dir=save_dir, dataset_name=name)
-        all_summaries.append(summary)
-        _print_summary(summary)
+
+        for mname, gen_fn in models_to_eval:
+            print(f"\n  -- Model: {mname} --")
+            summary, _raw = evaluate(gen_fn, dset, metrics, device,
+                                      is_paired=is_paired, seed=args.seed,
+                                      top_k=args.top_k, top_p=args.top_p,
+                                      save_imgs_dir=save_dir,
+                                      dataset_name=name, model_name=mname)
+            all_summaries.append(summary)
+            _print_summary(summary)
 
     # ---- Save combined report ----
     if all_summaries:
@@ -643,7 +738,8 @@ def _print_summary(s):
 
 
 def _print_comparative_table(summaries):
-    names = [s["dataset_name"] for s in summaries]
+    # Columns: (model, dataset). Group by this.
+    cols = [(s["model_name"], s["dataset_name"]) for s in summaries]
     rows = [
         ("Style Loss ↓",       "style_loss_mean"),
         ("Content Loss ↓",     "content_loss_mean"),
@@ -651,19 +747,22 @@ def _print_comparative_table(summaries):
         ("SSIM ↑",             "ssim_ref_mean"),
         ("DreamSim ↓",         "dreamsim_ref_mean"),
         ("CLIP sim ↑",         "clip_ref_mean"),
+        ("infer s/sample",     "infer_time_sec_mean"),
     ]
-    print("\n" + "="*80)
-    print("  Cross-dataset comparison")
-    print("="*80)
-    header = f"  {'Metric':<22s}" + "".join(f"{n:>18s}" for n in names)
+    col_labels = [f"{m}/{d[:12]}" for (m, d) in cols]
+    col_width = max(18, max(len(c) + 2 for c in col_labels))
+    print("\n" + "="*(28 + col_width * len(cols)))
+    print("  Cross-model × cross-dataset comparison")
+    print("="*(28 + col_width * len(cols)))
+    header = f"  {'Metric':<24s}" + "".join(f"{c:>{col_width}s}" for c in col_labels)
     print(header); print("-"*len(header))
     for label, key in rows:
-        line = f"  {label:<22s}"
+        line = f"  {label:<24s}"
         for s in summaries:
             v = s.get(key)
-            line += f"{'-':>18s}" if v is None else f"{v:>18.4f}"
+            line += f"{'-':>{col_width}s}" if v is None else f"{v:>{col_width}.4f}"
         print(line)
-    print("="*80)
+    print("="*len(header))
 
 
 if __name__ == "__main__":
