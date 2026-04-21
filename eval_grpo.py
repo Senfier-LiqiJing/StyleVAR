@@ -104,10 +104,38 @@ def _apply_lora_to_plain_state(base_state: dict, lora_state: dict,
 
 
 def _extract_state_dict(raw):
-    if isinstance(raw, dict):
-        if "trainer" in raw and "var_wo_ddp" in raw["trainer"]: return raw["trainer"]["var_wo_ddp"]
-        if "model" in raw: return raw["model"]
-    return raw
+    """Extract the model state_dict from various ckpt wrapping conventions.
+
+    Handles:
+      - Raw state_dict: {"blocks.0.attn...": tensor, ...}
+      - Anthropic-VAR style: {"trainer": {"var_wo_ddp": state_dict}}
+      - Our GRPO style:      {"model": state_dict, "optimizer": ..., ...}
+      - HuggingFace style:   {"state_dict": state_dict}
+      - Misc:                {"weights": ...}, {"params": ...}, {"model_state_dict": ...}
+    """
+    if not isinstance(raw, dict):
+        return raw
+    # Known wrapping keys (in priority order)
+    if "trainer" in raw and isinstance(raw["trainer"], dict) and "var_wo_ddp" in raw["trainer"]:
+        return raw["trainer"]["var_wo_ddp"]
+    for key in ("model", "state_dict", "model_state_dict", "weights", "params"):
+        v = raw.get(key)
+        if isinstance(v, dict) and len(v) > 0 and isinstance(next(iter(v.values())), torch.Tensor):
+            return v
+    # Heuristic: if the dict looks like a raw state_dict (values are Tensors),
+    # return it as-is.
+    if len(raw) > 0 and isinstance(next(iter(raw.values())), torch.Tensor):
+        return raw
+    # Last resort: single-key wrapping (e.g. {"net": state_dict})
+    if len(raw) == 1:
+        v = next(iter(raw.values()))
+        if isinstance(v, dict) and len(v) > 0 and isinstance(next(iter(v.values())), torch.Tensor):
+            return v
+    raise RuntimeError(
+        f"Could not find a state_dict in the ckpt. Top-level keys: {list(raw.keys())[:10]}. "
+        f"Accepted wrappers: {{trainer.var_wo_ddp, model, state_dict, model_state_dict, "
+        f"weights, params}}, or a raw state_dict."
+    )
 
 
 def load_model(ckpt_path: str, vae_ckpt: str, device: torch.device,
