@@ -573,10 +573,11 @@ def _save_quad(out_dir, fname, c_01, s_01, t_01, g_01):
 # =========================== CLI + orchestration ===========================
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt",     type=str, required=True,
-                   help="Path to the checkpoint to evaluate. "
+    p.add_argument("--ckpt",     type=str, default="",
+                   help="Path to the StyleVAR checkpoint to evaluate. "
                         "Accepts plain SFT / LoRA-wrapped full_state / merged GRPO ckpts / "
-                        "LoRA-only ckpts (requires --base_ckpt).")
+                        "LoRA-only ckpts (requires --base_ckpt). "
+                        "Can be omitted if --skip_stylevar is set (AdaIN-only run).")
     p.add_argument("--base_ckpt", type=str, default="",
                    help="Required if --ckpt is a LoRA-only checkpoint (contains only "
                         "lora_A/lora_B keys). The base onto which the LoRA delta is applied. "
@@ -628,6 +629,8 @@ def main():
     # ---- Load StyleVAR (unless skipped) ----
     model = None
     if not args.skip_stylevar:
+        if not args.ckpt:
+            raise RuntimeError("--ckpt is required unless --skip_stylevar is set.")
         model, vae = load_model(args.ckpt, args.vae_ckpt, device, base_ckpt_path=args.base_ckpt)
 
     # ---- Optionally load AdaIN baseline ----
