@@ -173,14 +173,30 @@ class LPIPSMetric(nn.Module):
 
 
 class SSIMMetric(nn.Module):
-    def __init__(self, device):
+    """Pure-torch SSIM (no torchmetrics dependency). Matches train_grpo.SSIMReward."""
+    def __init__(self, device, window_size: int = 11):
         super().__init__()
-        from torchmetrics.image import StructuralSimilarityIndexMeasure
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+        self.C1 = 0.01 ** 2
+        self.C2 = 0.03 ** 2
+        coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+        g = torch.exp(-(coords ** 2) / (2 * 1.5 ** 2)); g = g / g.sum()
+        w = (g[:, None] * g[None, :]).unsqueeze(0).unsqueeze(0).expand(3, 1, window_size, window_size)
+        self.register_buffer("window", w.contiguous())
+        self.pad = window_size // 2
+        self.to(device)
 
     @torch.no_grad()
     def forward(self, a_01, b_01):
-        return self.ssim(a_01, b_01).item()
+        w, pad = self.window, self.pad
+        mu_x = F.conv2d(a_01, w, padding=pad, groups=3)
+        mu_y = F.conv2d(b_01, w, padding=pad, groups=3)
+        mu_x2, mu_y2, mu_xy = mu_x.square(), mu_y.square(), mu_x * mu_y
+        sx  = F.conv2d(a_01.square(), w, padding=pad, groups=3) - mu_x2
+        sy  = F.conv2d(b_01.square(), w, padding=pad, groups=3) - mu_y2
+        sxy = F.conv2d(a_01 * b_01,   w, padding=pad, groups=3) - mu_xy
+        num = (2 * mu_xy + self.C1) * (2 * sxy + self.C2)
+        den = (mu_x2 + mu_y2 + self.C1) * (sx + sy + self.C2)
+        return (num / den).mean().item()
 
 
 class DreamSimMetric(nn.Module):
