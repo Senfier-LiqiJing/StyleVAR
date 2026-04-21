@@ -59,7 +59,8 @@ from models import build_vae_stylevar
 # =========================== Load-safe helpers =============================
 def _bake_lora_into_plain(state: dict, rank: int, alpha: float) -> dict:
     """Mirror of train_grpo.py's bake function. Converts a LoRA-wrapped state
-    dict into a plain one by folding lora_B@lora_A*scaling into base_weight."""
+    dict (with base_weight + lora_A + lora_B) into a plain one (just weight)
+    by folding lora_B@lora_A*scaling into base_weight."""
     scaling = alpha / rank
     lora_prefixes = {k[:-len(".lora_A")] for k in state.keys() if k.endswith(".lora_A")}
     if not lora_prefixes:
@@ -81,7 +82,36 @@ def _bake_lora_into_plain(state: dict, rank: int, alpha: float) -> dict:
     return out
 
 
-def load_model(ckpt_path: str, vae_ckpt: str, device: torch.device):
+def _apply_lora_to_plain_state(base_state: dict, lora_state: dict,
+                                rank: int, alpha: float) -> dict:
+    """Given a PLAIN base state_dict and a LoRA-ONLY state_dict (only lora_A/lora_B),
+    fold each module's lora_B@lora_A*scaling into the base's corresponding .weight."""
+    scaling = alpha / rank
+    out = dict(base_state)
+    lora_prefixes = {k[:-len(".lora_A")] for k in lora_state.keys() if k.endswith(".lora_A")}
+    n_applied = 0; missing = []
+    for p in lora_prefixes:
+        weight_key = p + ".weight"
+        if weight_key not in out:
+            missing.append(weight_key); continue
+        lA = lora_state[p + ".lora_A"]
+        lB = lora_state[p + ".lora_B"]
+        out[weight_key] = (out[weight_key] + (lB @ lA) * scaling).contiguous()
+        n_applied += 1
+    if missing:
+        raise RuntimeError(f"LoRA prefixes have no matching plain weight in base: {missing[:3]}...")
+    return out, n_applied
+
+
+def _extract_state_dict(raw):
+    if isinstance(raw, dict):
+        if "trainer" in raw and "var_wo_ddp" in raw["trainer"]: return raw["trainer"]["var_wo_ddp"]
+        if "model" in raw: return raw["model"]
+    return raw
+
+
+def load_model(ckpt_path: str, vae_ckpt: str, device: torch.device,
+               base_ckpt_path: str = ""):
     patch_nums = tuple(int(x) for x in "1_2_3_4_5_6_8_10_13_16".split("_"))
     vae, model = build_vae_stylevar(
         device=device, patch_nums=patch_nums,
@@ -96,23 +126,45 @@ def load_model(ckpt_path: str, vae_ckpt: str, device: torch.device):
     for p in vae.parameters(): p.requires_grad_(False)
 
     raw = torch.load(ckpt_path, map_location="cpu")
-    if isinstance(raw, dict):
-        if "trainer" in raw and "var_wo_ddp" in raw["trainer"]:
-            st = raw["trainer"]["var_wo_ddp"]
-        elif "model" in raw:
-            st = raw["model"]
-        else:
-            st = raw
-    else:
-        st = raw
+    st = _extract_state_dict(raw)
 
-    # Auto-bake if LoRA-wrapped (e.g. v2 full_state)
-    if any(k.endswith(".lora_A") for k in st.keys()):
-        args_dict = raw.get("args", {}) if isinstance(raw, dict) else {}
-        rank  = args_dict.get("lora_rank", 256)
-        alpha = args_dict.get("lora_alpha", 512.0)
-        print(f"[eval] detected LoRA-wrapped ckpt; baking (rank={rank}, alpha={alpha})")
+    # Detect checkpoint type from its keys
+    has_lora   = any(k.endswith(".lora_A") for k in st.keys())
+    has_base   = any(k.endswith(".base_weight") for k in st.keys())   # LoRA-wrapped full_state
+    has_plain  = any(k.endswith(".attn.mat_qkv_guide.weight") for k in st.keys())  # plain SFT/merged
+
+    args_dict = raw.get("args", {}) if isinstance(raw, dict) else {}
+    rank  = args_dict.get("lora_rank", 256)
+    alpha = args_dict.get("lora_alpha", 512.0)
+
+    if has_lora and not has_base and not has_plain:
+        # --- Case 3: LoRA-only ckpt. Need a base to stack onto. ---
+        if not base_ckpt_path:
+            raise RuntimeError(
+                f"[eval] {ckpt_path} is LoRA-only (no base_weight / weight keys).\n"
+                f"       Supply --base_ckpt (e.g. ckpt/sft-best.pth) to stack the LoRA onto."
+            )
+        print(f"[eval] detected LoRA-only ckpt (rank={rank}, alpha={alpha})")
+        print(f"[eval] loading base from {base_ckpt_path}")
+        base_raw = torch.load(base_ckpt_path, map_location="cpu")
+        base_state = _extract_state_dict(base_raw)
+        # If base is itself LoRA-wrapped, bake it first
+        if any(k.endswith(".base_weight") for k in base_state.keys()):
+            b_args = base_raw.get("args", {}) if isinstance(base_raw, dict) else {}
+            b_rank  = b_args.get("lora_rank", 256)
+            b_alpha = b_args.get("lora_alpha", 512.0)
+            print(f"[eval] base is LoRA-wrapped; baking (rank={b_rank}, alpha={b_alpha})")
+            base_state = _bake_lora_into_plain(base_state, b_rank, b_alpha)
+        final_state, n_applied = _apply_lora_to_plain_state(base_state, st, rank, alpha)
+        print(f"[eval] applied {n_applied} LoRA modules onto base")
+        st = final_state
+    elif has_base:
+        # --- Case 2: LoRA-wrapped full_state. Bake and load. ---
+        print(f"[eval] detected LoRA-wrapped full_state ckpt; baking (rank={rank}, alpha={alpha})")
         st = _bake_lora_into_plain(st, rank, alpha)
+    else:
+        # --- Case 1: Plain ckpt. Direct strict load. ---
+        print(f"[eval] detected plain ckpt")
 
     model.load_state_dict(st, strict=True)
     model.eval()
@@ -442,7 +494,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt",     type=str, required=True,
                    help="Path to the checkpoint to evaluate. "
-                        "Accepts plain SFT / LoRA-wrapped full_state / merged GRPO ckpts.")
+                        "Accepts plain SFT / LoRA-wrapped full_state / merged GRPO ckpts / "
+                        "LoRA-only ckpts (requires --base_ckpt).")
+    p.add_argument("--base_ckpt", type=str, default="",
+                   help="Required if --ckpt is a LoRA-only checkpoint (contains only "
+                        "lora_A/lora_B keys). The base onto which the LoRA delta is applied. "
+                        "Typically ckpt/sft-best.pth or ckpt/grpo-best.pth.")
     p.add_argument("--vae_ckpt", type=str, default="ckpt/vae_ch160v4096z32.pth")
     p.add_argument("--clip_local_dir", type=str, default="ckpt/clip-vit-base-patch32",
                    help="Local HF CLIP snapshot (leave empty to use HF hub)")
@@ -480,7 +537,7 @@ def main():
     print(f"[eval] device={device}  seed={args.seed}")
 
     # ---- Load model ----
-    model, vae = load_model(args.ckpt, args.vae_ckpt, device)
+    model, vae = load_model(args.ckpt, args.vae_ckpt, device, base_ckpt_path=args.base_ckpt)
 
     # ---- Build metrics once ----
     print("[eval] building metrics...")
