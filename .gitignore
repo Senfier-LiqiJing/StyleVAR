@@ -1,14 +1,62 @@
+# =====================================================================
+# StyleVAR .gitignore
+# =====================================================================
+
+# ---- Python bytecode / IDE / OS ----
+*.pyc
 *.swp
 **/__pycache__/**
 **/.ipynb_checkpoints/**
 .DS_Store
 .idea/*
 .vscode/*
-llava/
-_vis_cached/
-_auto_*
+
+# ---- Artifacts (checkpoints, logs, outputs) ----
 ckpt/
-# DreamSim accidental downloads (if cache_dir not set properly, falls back to ./models)
+Output/
+local_output*/
+grpo_output*/
+grpo_outputs/
+log/
+logs/
+tb*/
+img*/
+samples/
+eval_out*/
+pilot_results/
+pilot_out*/
+_vis_cached/
+_auto_*/
+wandb/
+llava/
+
+# ---- Data ----
+data/
+data_check.py
+split_data.py
+split_omnistyle.py
+prepare_data.py
+prepare_imagepulse.py
+extract_wikiart.py
+extract_clean_ckpt.py
+DATA_STRUCTURE.md
+
+# ---- Binaries / large files ----
+*.pth
+*.pth.tar
+*.ckpt
+*.log
+*.tar.gz
+*.zip
+*.whl
+*.pdf
+*.ipynb
+
+# ---- Text artifacts (keep requirements.txt) ----
+*.txt
+!requirements.txt
+
+# ---- DreamSim accidental downloads ----
 models/pretrained.zip
 models/checkpoints/
 models/ensemble_lora/
@@ -17,27 +65,35 @@ models/dino_vitb16_pretrain.pth
 models/clip_vitb16_pretrain.pth.tar
 models/open_clip_vitb16_pretrain.pth.tar
 models/trusted_list
-log/
-tb*/
-img*/
-local_output*
-*.pth
-*.pth.tar
-*.ckpt
-*.log
-*.txt
-!requirements.txt
-*.ipynb
-data
-flash_attn-2.8.0+cu121torch2.4-cp310-cp310-linux_x86_64.whl
-!quick_infer.ipynb
-grpo_output/
-Output/
+
+# ---- One-off / setup / download scripts ----
+download_*.sh
+setup_env*.sh
 download_ckpt.sh
-extract_wikiart.py
+
+# ---- Infra scripts we don't version (old VAR repo deps) ----
+dist.py
+PROJECT_STRUCTURE.md
+
+# ---- Research-side scripts (pilots, tests, merge tools) ----
+pilot_*.py
+run_pilots.sh
+test_*.py
+verify_*.py
+test_dependency.py
+
+# ---- Deprecated / legacy run scripts ----
+run_grpo.sh
+run_grpo_v4.sh
+run_train.sh
+run_train_v2.sh
+
+# ---- Ad-hoc misc artifacts ----
+archive.tar.gz
+quick_infer.ipynb
 grpo_infer_results_comparison.png
 infer_results.png
-quick_infer.ipynb
 style_strength_sweep.png
-test_dependency.py
-wandb/
+"midterm report"/
+reference/
+assets/
