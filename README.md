@@ -3,6 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Project Page](https://img.shields.io/badge/Project-Page-green)](https://github.com/Senfier-LiqiJing/StyleVAR)
 [![Paper](https://img.shields.io/badge/Paper-PDF-red)](StyleVAR_Controllable_Image_Style_Transfer_via_Visual_Autoregressive_Modeling.pdf)
+[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Model-yellow)](https://huggingface.co/Senfier-LiqiJing/StyleVAR)
 
 ![StyleVAR Qualitative Results](assets/sample.png)
 
@@ -83,13 +84,21 @@ cd StyleVAR
 pip install -r requirements.txt
 ```
 
-Place the VQ-VAE and SFT/GRPO checkpoints under `ckpt/`:
+Download the released checkpoints from the HuggingFace repo into `ckpt/`:
+
+```bash
+hf download Senfier-LiqiJing/StyleVAR \
+  vae_ch160v4096z32.pth StyleVAR_SFT.pth StyleVAR-GRPO.pth \
+  --local-dir ckpt
+```
+
+Expected layout:
 
 ```
 ckpt/
 ├── vae_ch160v4096z32.pth          # frozen VQ-VAE
-├── sft-best.pth                   # Stage 1 checkpoint
-├── grpo-best.pth                  # Stage 2 merged checkpoint
+├── StyleVAR_SFT.pth               # Stage 1 checkpoint
+├── StyleVAR-GRPO.pth              # Stage 2 checkpoint (LoRA already merged)
 └── clip-vit-base-patch32/         # for CLIP-Sim metric
 ```
 
@@ -219,11 +228,17 @@ We compare StyleVAR (SFT and GRPO) against an AdaIN baseline on three benchmarks
 - GRPO improves over the SFT checkpoint on the majority of metrics on every dataset, most notably DreamSim and CLIP similarity — the two signals aligned with the reinforcement reward — confirming that reward-guided fine-tuning sharpens the SFT-learned style/content trade-off without destabilizing the policy.
 - AdaIN retains a roughly two-orders-of-magnitude advantage in inference cost, reflecting the gap between a single feed-forward pass and a 10-scale autoregressive procedure.
 
+### Qualitative SFT vs. GRPO Comparison
+
+![SFT vs GRPO Samples](assets/Sample-SFT-GRPO.png)
+
+*Figure 2. Side-by-side outputs from the SFT checkpoint (Stage 1) and the GRPO-refined checkpoint (Stage 2) on identical content-style pairs. GRPO sharpens stylistic alignment while preserving the structural integrity learned during SFT.*
+
 ### Training Dynamics
 
 ![SFT Training Dynamics](assets/training_dynamics.png)
 
-*Figure 2. Stage 1 SFT loss (left) and top-$k$ accuracy (right) across global iterations.*
+*Figure 3. Stage 1 SFT loss (left) and top-$k$ accuracy (right) across global iterations.*
 
 ---
 
