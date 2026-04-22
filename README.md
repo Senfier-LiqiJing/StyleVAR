@@ -24,7 +24,8 @@
 
 ---
 
-## Table of Contents
+<details>
+<summary><b>Table of Contents</b></summary>
 
 - [Method](#method)
 - [Installation](#installation)
@@ -37,6 +38,8 @@
 - [Repository Layout](#repository-layout)
 - [Citation](#citation)
 - [References](#references)
+
+</details>
 
 ---
 
