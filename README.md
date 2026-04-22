@@ -46,13 +46,13 @@
 
 Given a content image $x_c$ and a style image $x_s$, a shared VQ-VAE tokenizes each into multi-scale codes $C=\{c^1,\dots,c^K\}$ and $S=\{s^1,\dots,s^K\}$. The target image is generated scale by scale:
 
-$$P(x \mid x_s, x_c) = \prod_{k=1}^{K} P\big(r^k \mid r^{<k}, s^k, c^k\big).$$
+$$P(x \mid x_s, x_c) = \prod_{k=1}^{K} P\big(r^k \mid r^{\lt k}, s^k, c^k\big).$$
 
 Within each transformer block, the target features are updated via
 
 $$h_\text{new} = h + \Big[\alpha \cdot \text{Attn}(Q{=}s^k, K{=}h, V{=}h) + (1-\alpha) \cdot \text{Attn}(Q{=}c^k, K{=}h, V{=}h)\Big].$$
 
-Assigning the target history to $K,V$ and the conditions to $Q$ keeps the autoregressive aggregation of $r^{<k}$ intact; style and content act as a *search query* over the target's own past rather than as a raw signal to copy from.
+Assigning the target history to $K,V$ and the conditions to $Q$ keeps the autoregressive aggregation of $r^{\lt k}$ intact; style and content act as a *search query* over the target's own past rather than as a raw signal to copy from.
 
 ![StyleVAR Framework](assets/framework.png)
 
