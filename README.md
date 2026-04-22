@@ -2,134 +2,80 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Project Page](https://img.shields.io/badge/Project-Page-green)](https://github.com/Senfier-LiqiJing/StyleVAR)
+[![Paper](https://img.shields.io/badge/Paper-PDF-red)](StyleVAR_Controllable_Image_Style_Transfer_via_Visual_Autoregressive_Modeling.pdf)
 
-**StyleVAR** is a reference-based image style transfer framework built upon Visual Autoregressive Modeling (VAR). This work formulates style transfer as conditional discrete sequence modeling in a multi-scale latent space, introducing a novel **Blended Cross-Attention** mechanism to balance content preservation and style intensity. The autoregressive generation is based on **Image Only**, not containing any text information. The method preserves structural semantics of the content image while adopting the artistic texture of the style image through a principled attention-based conditioning strategy.
+![StyleVAR Qualitative Results](assets/sample.png)
 
-> **Authors**: Liqi Jing, Dingming Zhang, Peinian Li
+**StyleVAR** is a reference-based image style transfer framework built on Visual Autoregressive Modeling (VAR). We formulate style transfer as conditional discrete sequence modeling in a multi-scale latent space and introduce a **Blended Cross-Attention** mechanism that lets style and content features act as queries over the target's autoregressive history, preserving content structure while absorbing style texture. We train the model in two stages — supervised fine-tuning (SFT) on paired triplets, followed by GRPO reinforcement fine-tuning with a DreamSim-based perceptual reward and Per-Action Normalization Weighting (PANW) to rebalance credit across scales.
+
+> **Authors**: Liqi Jing, Dingming Zhang, Peinian Li, Lichen Zhu
 > **Affiliation**: Duke University
-> **Date**: December 17, 2025
 
 ---
 
-## 📖 Table of Contents
+## Highlights
 
-- [Abstract](#-abstract)
-- [Introduction](#-introduction)
-- [Methodology](#-methodology)
-- [Installation](#-installation)
-- [Dataset](#-dataset)
-- [Training](#-training)
-- [Inference](#-inference)
-- [Experimental Results](#-experimental-results)
-- [Limitations and Discussion](#-limitations-and-discussion)
-- [Future Work](#-future-work)
-- [Project Roadmap](#-project-roadmap)
-- [Team Contributions](#-team-contributions)
-- [References](#-references)
+- **Image-only conditioning.** No text prompts; the model consumes a content image and a style image and generates the stylized output autoregressively over 10 scales ($1{\times}1 \to 16{\times}16$, $L=680$ tokens).
+- **Blended Cross-Attention.** Style and content features serve as queries that re-weight the target's own history ($K$, $V$), preserving VAR's next-scale prediction paradigm.
+- **Two-stage training.** SFT teaches the model to reproduce plausible stylizations from paired data; a second GRPO stage directly optimizes a perceptual DreamSim reward on the decoded image with LoRA adapters (rank 256).
+- **Scale-aware credit assignment.** PANW down-weights the finest scales ($256\times$ token imbalance) so coarse scales that set layout and semantics still receive meaningful gradient.
+- **Iterative reference update.** The KL anchor is periodically refreshed via peak-triggered merge, turning single-shot RFT into stable iterative GRPO.
 
 ---
 
-## 📄 Abstract
+## Table of Contents
 
-This project studies reference-based image style transfer: given a content image and a style image, the goal is to generate an output that preserves the structural semantics of the content while adopting the artistic texture of the style. We build on the Visual Autoregressive Modeling (VAR) framework and formulate style transfer as conditional discrete sequence modeling in a learned latent space. Images are decomposed into multi-scale representations and tokenized into discrete codes by a VQ-VAE; a transformer then autoregressively models the distribution of target tokens conditioned on style and content tokens.
-
-To inject style and content information, we introduce a **blended cross-attention mechanism** in which the evolving target representation attends to its own history, while style and content features act as queries that decide which aspects of this history to emphasize. A scale-dependent blending coefficient controls the relative influence of style and content at each stage, encouraging the synthesized representation to align with both the content structure and the style texture without breaking the autoregressive continuity of VAR.
-
-We fine-tune this StyleVAR model from a pretrained VAR checkpoint on a large triplet dataset of content–style–target images and evaluate it on held-out pairs. Qualitative results indicate that the method can transfer texture while maintaining semantic structure, especially for landscapes and architectural scenes, while a generalization gap on internet images and difficulty with human faces highlight the need for better content diversity and stronger structural priors.
-
----
-
-## 📝 Introduction
-
-Reference-based image style transfer aims to generate an image that preserves the spatial layout and object semantics of a content image while adopting the colors, textures, and local patterns of a style image. This setting is valuable in artistic creation, visual prototyping, and controllable data augmentation, where users wish to restyle an existing scene without altering its high-level semantic meaning.
-
-### Motivation and Challenges
-
-Balancing content preservation and style strength presents fundamental challenges:
-- **Content-Style Trade-off**: Overemphasis on content results in weak stylization; overemphasis on style may distort object shapes or introduce artifacts that break semantic coherence.
-- **Style Diversity**: Styles vary widely—some primarily change global tone, while others rely on fine-grained textures and patterns.
-- **Computational Efficiency**: Diffusion-based approaches require many iterative denoising steps, leading to slow sampling and high computational cost.
-
-### Our Approach
-
-StyleVAR adopts the Visual Autoregressive Modeling (VAR) framework and casts style transfer as **conditional discrete sequence modeling** in a multi-scale latent space. Each image is decomposed into a hierarchy of feature maps and tokenized into discrete codes by a VQ-VAE encoder. The target image is generated scale by scale, with each set of target tokens conditioned on:
-1. The history of previously generated tokens
-2. Corresponding style and content tokens at each scale
-
-**Key Innovation**: The **Blended Cross-Attention** mechanism allows style and content features (as Queries) to selectively emphasize relevant aspects of the target's autoregressive history (Keys and Values), ensuring structural continuity while enabling effective style transfer.
+- [Method](#method)
+- [Installation](#installation)
+- [Datasets](#datasets)
+- [Training](#training)
+- [Evaluation](#evaluation)
+- [Inference](#inference)
+- [Results](#results)
+- [Limitations](#limitations)
+- [Repository Layout](#repository-layout)
+- [Citation](#citation)
+- [References](#references)
 
 ---
 
-## 🏗️ Methodology
+## Method
 
-### 2.1 Blended Cross-Attention Autoregressive Modeling
+### Blended Cross-Attention
 
-#### Formulation
+Given a content image $x_c$ and a style image $x_s$, a shared VQ-VAE tokenizes each into multi-scale codes $C=\{c^1,\dots,c^K\}$ and $S=\{s^1,\dots,s^K\}$. The target image is generated scale by scale:
 
-In the context of style transfer, the objective is to predict a target image that preserves the structural semantics of a content image $x_c$ while adopting the artistic texture of a style image $x_s$. Adopting the framework of Visual Autoregressive Modeling (VAR), we decompose images into multi-scale representations. Each scale's feature map is tokenized into discrete tokens.
+$$P(x \mid x_s, x_c) = \prod_{k=1}^{K} P\big(r^k \mid r^{<k}, s^k, c^k\big).$$
 
-Formally, the style image tokens are denoted as $S = \{s^1, s^2, \ldots, s^K\} = \mathcal{E}(x_s)$, and the content image tokens as $C = \{c^1, c^2, \ldots, c^K\} = \mathcal{E}(x_c)$, where $K$ represents the total number of scales and $\mathcal{E}(\cdot)$ denotes the VQ-VAE tokenization process.
+Within each transformer block, the target features are updated via
 
-The generation of the target image, denoted as $R = \{r^1, r^2, \ldots, r^K\}$, proceeds in a scale-wise autoregressive manner:
+$$h_\text{new} = h + \Big[\alpha \cdot \text{Attn}(Q{=}s^k, K{=}h, V{=}h) + (1-\alpha) \cdot \text{Attn}(Q{=}c^k, K{=}h, V{=}h)\Big].$$
 
-$$P(x|x_s, x_c) = \prod_{k=1}^{K} P(r^k | r^{1:k-1}, s^k, c^k)$$
-
-where $r^k$ denotes the target features at the $k$-th scale, and $r^{1:k-1}$ represents the history of generated target features prior to the $k$-th scale.
-
-#### Model Structure
-
-Within each transformer block, the feature update process is expressed as:
-
-$$h_{new} = h + [\alpha \cdot \text{Attn}(Q=s^k, K=h, V=h) + (1-\alpha) \cdot \text{Attn}(Q=c^k, K=h, V=h)]$$
-
-Where:
-- $h$: Input target features at stage $k$ (or output of the preceding transformer block)
-- $s^k, c^k$: Style and Content features at scale $k$ (acting as Queries)
-- $\alpha_k$: Heuristic hyperparameter governing the blending ratio between style and content information
-- Keys ($K$) and Values ($V$): Target feature history
+Assigning the target history to $K,V$ and the conditions to $Q$ keeps the autoregressive aggregation of $r^{<k}$ intact; style and content act as a *search query* over the target's own past rather than as a raw signal to copy from.
 
 ![StyleVAR Framework](assets/framework.png)
-*Figure 1: The framework of the proposed StyleVAR. The Blended Cross-Attention mechanism injects style and content information into the autoregressive generation process.*
 
-### 2.2 Training and Inference
+*Figure 1. The StyleVAR transformer with Blended Cross-Attention.*
 
-#### Inference Process
+### Stage 2: GRPO with PANW
 
-The inference process begins by initializing the start token at the first scale using content features extracted via a ResNet-18 backbone, projected to the embedding dimension via an MLP. A critical component is the progressive accumulation of features:
+After SFT, we add a second stage that optimizes a decoded-image reward with GRPO. For each triplet $(x_c, x_s, x)$ we sample $G=16$ rollouts from the current policy, decode each with the VQ-VAE, score with $R(\hat{x}, x) = -\lambda \cdot \text{DreamSim}(\hat{x}, x)$, and compute a group-relative advantage:
 
-1. **Pre-calculation**: Style and content features are fully observable; their multi-scale ground truth tokens are pre-calculated via VQ-VAE decomposition
-2. **Cumulative Generation**: A cumulative feature map $\hat{f}$ is maintained; at each step, generated tokens $r^k$ are quantized and added to $\hat{f}$ in a residual manner
-3. **Downsampling**: $\hat{f}$ is downsampled to the appropriate resolution to serve as input for the next scale
+$$A^{(i)} = \frac{R^{(i)} - \text{mean}_j R^{(j)}}{\text{std}_j R^{(j)} + \varepsilon_\text{std}}.$$
 
-#### Training Strategy
+To compensate for the $256\times$ token imbalance between the $1{\times}1$ and $16{\times}16$ scales, per-token losses are reweighted by
 
-During training, we employ a teacher-forcing strategy:
-1. Concatenate the start token with ground truth tokens of the target image across all scales
-2. Following the vanilla VAR paradigm, predict logits for stages 1 to $K$ in parallel
-3. Calculate Cross-Entropy loss between predicted logits and ground truth codebook indices
-4. Input at any stage $k$ is the accumulation of ground truth features from all preceding scales (1 to $k-1$)
+$$w_t = \frac{1}{Z}(h_k \cdot w_k)^{-\gamma}, \qquad \gamma \in [0.6, 0.8],$$
 
-### 2.3 Design Rationale: Attention Configuration
+so that coarse scales receive roughly $60\times$ the per-token weight of the finest scale. The GRPO objective combines a PPO-style clipped surrogate with a Schulman k3 KL penalty against a reference policy; whenever the running reward surpasses the reference baseline by a meaningful margin, the LoRA delta is baked into the base and a fresh zero-initialized adapter is attached, converting single-shot RFT into iterative GRPO. An emergency merge fires if the raw KL exceeds 2.0 to prevent policy divergence.
 
-#### Preserving Autoregressive Continuity
-
-A critical design decision in StyleVAR is assigning target image features to the Key ($K$) and Value ($V$) roles, while assigning style/content features to the Query ($Q$) role. This configuration diverges from standard cross-attention mechanisms but is essential for preserving the "next-scale prediction" paradigm of VAR.
-
-By designating the target feature history as $K$ and $V$, the attention mechanism explicitly aggregates information from the target's own past. The style and content features (as $Q$) act as a "search query", determining which parts of the target's history are most relevant to emphasize for the current generation step.
-
-#### Theoretical Viability
-
-By setting $V$ as the target features, the output of the attention block becomes a linear combination of the target's own history. While this does not directly "copy" pixels from the style image, the style-guided re-weighting (via the $Q \times K^T$ score) is theoretically sufficient to modulate the generative trajectory, effectively steering the autoregressive process to adopt the desired stylistic characteristics while maintaining structural integrity.
+See [GRPO.md](GRPO.md) for the full algorithm, hyperparameter history, and lessons learned.
 
 ---
 
-## ⚙️ Installation
+## Installation
 
-Please ensure your environment meets the following requirements (based on VAR dependencies):
-
-- Python 3.8+
-- PyTorch 2.0+
-- NVIDIA GPU (A100 recommended for training as per report configuration)
+Requirements: Python 3.8+, PyTorch 2.0+, CUDA GPU (trained on a single NVIDIA 4090 48GB).
 
 ```bash
 git clone https://github.com/Senfier-LiqiJing/StyleVAR.git
@@ -137,365 +83,224 @@ cd StyleVAR
 pip install -r requirements.txt
 ```
 
----
+Place the VQ-VAE and SFT/GRPO checkpoints under `ckpt/`:
 
-## 📊 Dataset
-
-### OmniStyle-150K Dataset
-
-We utilized the **OmniStyle-150K** dataset for training, which consists of 143,992 triplets: (content image, style image, target image). The data is structured such that each target image is paired with its corresponding source content and style inputs.
-
-**Data Augmentation**: To enhance model robustness and force the network to learn fine-grained structural and textural details, we applied data augmentation during preprocessing:
-- **Content Images**: Rotation and brightness adjustments
-- **Style Images**: Random cropping
-
-**Dataset Composition Analysis**: While the dataset contains approximately 150k triplets, further analysis revealed these are generated from a limited pool of approximately 1,800 unique content images. This data imbalance has implications for model generalization, as discussed in the [Limitations](#-limitations-and-discussion) section.
-
----
-
-## 🚀 Training
-
-### Training Configuration
-
-**Initialization**: We initialized StyleVAR weights using the pre-trained vanilla VAR model checkpoint. The VQ-VAE component was frozen while fine-tuning the full 600M parameters of the transformer.
-
-**Architecture Adaptation**: Since StyleVAR utilizes a dual-stream input (target features and content/style condition features), the original projection layers of vanilla VAR were duplicated to initialize distinct projection layers for both the target and condition streams. Feed-Forward Networks (FFN) were initialized with the original VAR parameters.
-
-### Hyperparameters
-
-| Parameter | Value |
-|-----------|-------|
-| Total Epochs | 8 |
-| Learning Rate (Epochs 1-6) | 5 × 10⁻⁴ |
-| Learning Rate (Epochs 7-8) | 1 × 10⁻⁴ |
-| Physical Batch Size per GPU | 4 |
-| Gradient Accumulation Steps | 128 |
-| Effective Global Batch Size | 1,024 |
-| Hardware | 2× NVIDIA A100 (40GB) |
-
-### Training Command
-
-```bash
-python train.py \
-  --data_path /path/to/OmniStyle-150K \
-  --batch_size 4 \
-  --grad_accum 128 \
-  --epochs 8 \
-  --lr 5e-4 \
-  --lr_decay_epoch 6
+```
+ckpt/
+├── vae_ch160v4096z32.pth          # frozen VQ-VAE
+├── sft-best.pth                   # Stage 1 checkpoint
+├── grpo-best.pth                  # Stage 2 merged checkpoint
+└── clip-vit-base-patch32/         # for CLIP-Sim metric
 ```
 
 ---
 
-## 🎨 Inference
+## Datasets
 
-### Autoregressive Generation Process
+Both training stages use a concatenation of two paired style-transfer datasets:
 
-The inference pipeline follows a stage-wise autoregressive generation strategy:
+| Dataset | # Triplets | Role |
+|---|---|---|
+| [OmniStyle-150K](https://www.modelscope.cn/datasets/DiffSynth-Studio/OmniStyle) | 143,992 | Broad distribution of artistic styles over natural content |
+| [ImagePulse-StyleTransfer](https://www.modelscope.cn/datasets/DiffSynth-Studio/ImagePulse-StyleTransfer) | 137,886 | Additional stylization diversity and content domain coverage |
 
-1. **Condition Preparation**: Pre-encode style and content images via VQ-VAE to obtain multi-scale token sequences $S$ and $C$
-2. **Initialization**: Initialize the start token using content features extracted via ResNet-18 backbone
-3. **Stage-wise Generation**: For each scale $k = 1$ to $K$:
-   - Pass current input through transformer to obtain logits
-   - Sample tokens $r^k$ using top-k/top-p sampling
-   - Look up quantized features from codebook
-   - Accumulate features to cumulative map $\hat{f}$
-   - Downsample $\hat{f}$ for next scale input (if $k < K$)
-4. **Image Reconstruction**: Decode cumulative feature map $\hat{f}$ using VQ-VAE decoder
+The two corpora are merged into a single **267,710-sample** training set with a 95/5 train/val split. During SFT we apply rotation and brightness perturbations to content images and random cropping to style images; GRPO rollouts are performed without augmentation to keep the conditioning signal deterministic across the $G$ samples in a group.
 
-### Inference Command
+For out-of-distribution evaluation we additionally construct random (COCO, WikiArt) content-style pairs that intentionally break the semantic correlation present in the paired training data.
 
-```bash
-python inference.py \
-  --content_image /path/to/content.jpg \
-  --style_image /path/to/style.jpg \
-  --output_path /path/to/output.jpg \
-  --checkpoint /path/to/checkpoint.pth \
-  --sampling_method top_p \
-  --top_p 0.95
+Expected layout under `data/`:
+
+```
+data/
+├── OmniStyle-150k/
+├── ImagePulse/
+├── coco2017/images/train2017/
+└── wikiart/
 ```
 
-### Performance
+---
 
-- **Average Inference Time**: ~0.40 seconds per image (256×256 resolution)
-- **Throughput**: ~2.48 FPS on NVIDIA A100 GPU
+## Training
+
+### Stage 1 — Supervised Fine-Tuning
+
+Initialize from the pretrained vanilla VAR checkpoint. The VQ-VAE is frozen; the full 600M transformer is fine-tuned. Because StyleVAR uses a dual-stream input (target features and content/style conditions), the original VAR projection layers for $Q/K/V$ are duplicated to produce distinct projections for the target and condition streams; FFNs inherit VAR's weights unchanged.
+
+| Setting | Value |
+|---|---|
+| Epochs | 10 |
+| Learning rate | $5\times10^{-4}$ (epochs 1-6) $\to$ $1\times10^{-4}$ (epochs 7-10) |
+| Batch size (with grad-accum) | 128 |
+| Hardware | 1× NVIDIA 4090 (48GB) |
+
+### Stage 2 — GRPO Reinforcement Fine-Tuning
+
+LoRA adapters ($r{=}256$, $\alpha/r{=}2$) are attached to every attention ($W_Q^\text{target}$, $W_{QKV}^\text{cond}$, $W_\text{proj}$) and FFN ($W_{\text{fc}1}$, $W_{\text{fc}2}$) linear, yielding 131M trainable parameters (18.2% of the backbone). The reference policy is realized *in place* by disabling the LoRA path during a forward pass on the same model, so no extra copy is kept in memory.
+
+| Setting | Value |
+|---|---|
+| Reward | $R = -\lambda \cdot \text{DreamSim}(\hat{x}, x)$, $\lambda{=}5.0$ |
+| Group size $G$ | 16 |
+| Sampling | top-$k{=}900$, top-$p{=}0.96$ |
+| Clip ratio $\varepsilon$ | 0.2 |
+| KL coefficient $\beta$ | 0.1 |
+| PANW exponent $\gamma$ | 0.7 |
+| Optimizer | AdamW, lr $1\times10^{-5}$, wd 0.01, $(\beta_1,\beta_2){=}(0.9, 0.95)$ |
+| Precision | FP32 (mixed precision caused $\log\pi_\theta$ drift between rollout and update) |
+| Merge gain / patience / cool-down | $\tau_\text{gain}{=}0.05$ / $\tau_\text{patience}{=}50$ / 300 steps |
+| Emergency merge | raw KL $> 2.0$, 50-step cool-down |
+| Hardware | 1× NVIDIA 4090 (48GB), physical batch 16, $G{=}16$ serial rollouts |
+
+### Commands
+
+```bash
+# Stage 1 (SFT)
+bash scripts/run_train.sh       # if you have your own SFT launcher
+
+# Stage 2 (GRPO) — starts from ckpt/sft-best.pth by default
+bash scripts/run_grpo_v5.sh
+
+# Merge a GRPO LoRA checkpoint back into the SFT base
+python scripts/merge_grpo_lora.py \
+  --sft_ckpt  ckpt/sft-best.pth \
+  --grpo_ckpt grpo_output_v5/grpo_best.pth \
+  --out       ckpt/grpo-best.pth
+```
 
 ---
 
-## 📈 Experimental Results
+## Evaluation
 
-### 3.1 Quantitative Analysis
+One-click evaluation on all three benchmarks (OmniStyle in-domain, ImagePulse near-domain, COCO+WikiArt out-of-domain):
 
-After 8 epochs of fine-tuning, the model demonstrated promising convergence:
-- **Mean Accuracy** (averaged across all scales): 14.72% top-1 accuracy
-- **Tail Accuracy** (final resolution scale): 16.26% top-1 accuracy
+```bash
+bash scripts/run_eval.sh ckpt/grpo-best.pth eval_out_grpo     # evaluate GRPO
+bash scripts/run_eval.sh ckpt/sft-best.pth  eval_out_sft      # evaluate SFT baseline
+bash scripts/run_eval.sh --also_adain --skip_stylevar         # AdaIN baseline only
+```
 
-### 3.2 Benchmark Comparison: StyleVAR vs. AdaIN
-
-We benchmarked StyleVAR on 500 randomly selected style-content image pairs:
-- **Style Images**: Randomly selected from WikiArt dataset
-- **Content Images**: Randomly selected from MS-COCO dataset
-
-#### Quantitative Results
-
-| Metric | StyleVAR | AdaIN | Better |
-|--------|----------|-------|--------|
-| **Speed (FPS)** | 2.48 | 317.97 | AdaIN ↑ |
-| **Avg Inference Time (s)** | 0.4031 | 0.0031 | AdaIN ↑ |
-| **Style Preservation** (Style Loss) ↓ | 0.1081 | **0.0983** | AdaIN |
-| **Content Preservation** (Content Loss) ↓ | **119.94** | 177.23 | **StyleVAR** |
-| **Structure Preservation** (SSIM) ↑ | **0.3224** | 0.1884 | **StyleVAR** |
-| **Perceptual Distance** (LPIPS) ↓ | **0.6297** | 0.7712 | **StyleVAR** |
-
-**Key Findings**:
-- **Content & Structure**: StyleVAR achieves **significantly better content preservation** (119.94 vs. 177.23) and **structure preservation** (0.3224 vs. 0.1884 SSIM)
-- **Perceptual Quality**: StyleVAR demonstrates **lower perceptual distance** (0.6297 vs. 0.7712 LPIPS), indicating more realistic outputs
-- **Style Transfer**: AdaIN shows slightly better style loss (0.0983 vs. 0.1081), suggesting more aggressive style transfer
-- **Efficiency Trade-off**: AdaIN is ~128× faster, reflecting the computational cost of autoregressive generation
-
-### 3.3 Training Dynamics
-
-![Training Loss and Accuracy](assets/training_dynamics.png)
-*Figure 2: Loss and accuracy of training set across iterations. The model demonstrates consistent convergence with both mean accuracy and tail accuracy improving throughout training.*
-
-> Note: Training dynamics visualization to be added. The model achieved 14.72% mean accuracy and 16.26% tail accuracy after 8 epochs.
-
-### 3.4 Qualitative Analysis
-
-Generated samples demonstrate that StyleVAR successfully transfers artistic textures while maintaining the semantic structure of content images:
-
-![Qualitative Results](assets/sample.png)
-*Figure 3: The generated images demonstrate that the model successfully transfers texture while maintaining the semantic structure of the content. (Left: Content Image, Middle: Style Image, Right: Generated Output)*
-
-**Observations**:
-- **Landscapes & Architecture**: Excellent texture transfer with preserved spatial layout
-- **Complex Textures**: Successfully adopts fine-grained artistic patterns (e.g., brushstrokes, color palettes)
-- **Semantic Coherence**: Maintains object boundaries and semantic structure
+Reported metrics: Style Loss (VGG-19 Gram), Content Loss (VGG-19 `conv4_2`), LPIPS, SSIM, DreamSim, CLIP-Sim, plus per-sample inference time.
 
 ---
 
-## ⚠️ Limitations and Discussion
+## Inference
 
-Despite strong performance on training and validation sets, qualitative evaluation revealed several important limitations:
+```bash
+python eval/infer_grpo.py \
+  --grpo_ckpt ckpt/grpo-best.pth \
+  --sft_ckpt  ckpt/sft-best.pth \
+  --num 8 --out grpo_infer_results.png
+```
 
-### Generalization Gap
-
-**Observation**: Performance degradation when testing on unseen images collected from the internet, indicating overfitting to the training distribution.
-
-**Root Cause Analysis**: The OmniStyle-150K dataset contains ~150k triplets generated from only ~1,800 unique content images. Given StyleVAR's capacity (600M parameters), the model likely memorized structural priors of this limited content set rather than learning generalized content representations.
-
-### Domain-Specific Performance Disparity
-
-**Strong Performance**: Landscapes and architectural scenes
-**Weak Performance**: Human faces
-
-**Hypothesized Causes**:
-1. **Complexity**: Facial topology is significantly more complex and sensitive to structural deformation than natural scenes
-2. **Perceptual Sensitivity**: Human visual perception is acutely sensitive to structural anomalies in facial features
-3. **Training Data Distribution**: Limited representation of human faces in the training dataset
-
-### Computational Cost
-
-While StyleVAR achieves superior content preservation and perceptual quality compared to AdaIN, it is ~128× slower (2.48 FPS vs. 317.97 FPS), limiting real-time applications.
+Pass `--sft_only` to visualize the SFT baseline without loading a LoRA checkpoint. The script also produces a side-by-side SFT/GRPO comparison grid.
 
 ---
 
-## 🔮 Future Work
+## Results
 
-We plan to address generalization, controllability, and training efficiency through the following research directions:
+We compare StyleVAR (SFT and GRPO) against an AdaIN baseline on three benchmarks spanning in-, near-, and out-of-distribution regimes. Arrows indicate whether higher ($\uparrow$) or lower ($\downarrow$) is better. **Best** is bold; <ins>second best</ins> is underlined.
 
-### 5.1 Data Augmentation and Diversification
+| Dataset | Method | Style Loss $\downarrow$ | Content Loss $\downarrow$ | LPIPS $\downarrow$ | SSIM $\uparrow$ | DreamSim $\downarrow$ | CLIP Sim $\uparrow$ | Infer (s) $\downarrow$ |
+|---|---|---|---|---|---|---|---|---|
+| **OmniStyle** | AdaIN          | 0.0625 | 198.3449 | 0.7506 | 0.1421 | 0.6522 | 0.6555 | **0.0079** |
+|               | StyleVAR (SFT) | <ins>0.0468</ins> | <ins>116.3569</ins> | <ins>0.4743</ins> | <ins>0.3975</ins> | <ins>0.2276</ins> | <ins>0.8704</ins> | 0.4031 |
+|               | StyleVAR (GRPO)| **0.0466** | **114.5686** | **0.4656** | **0.4024** | **0.2164** | **0.8740** | 0.4031 |
+| **ImagePulse**| AdaIN          | 0.0735 | 223.4699 | 0.7802 | 0.1574 | 0.6958 | 0.5651 | **0.0029** |
+|               | StyleVAR (SFT) | <ins>0.0452</ins> | **180.7923** | <ins>0.5618</ins> | <ins>0.4282</ins> | <ins>0.3168</ins> | <ins>0.7903</ins> | 0.4031 |
+|               | StyleVAR (GRPO)| **0.0387** | <ins>182.0954</ins> | **0.5572** | **0.4320** | **0.2979** | **0.8000** | 0.4031 |
+| **COCO+WikiArt** | AdaIN       | 0.0282 | 171.0877 | 0.7688 | 0.1985 | 0.7536 | 0.5319 | **0.0027** |
+|               | StyleVAR (SFT) | <ins>0.0206</ins> | <ins>160.1233</ins> | <ins>0.7398</ins> | **0.2713** | <ins>0.6986</ins> | <ins>0.5308</ins> | 0.4031 |
+|               | StyleVAR (GRPO)| **0.0199** | **157.5109** | **0.7286** | <ins>0.2677</ins> | **0.6793** | **0.5335** | 0.4031 |
 
-**Objective**: Improve generalization to diverse content types
+*Table 1. Cross-model and cross-dataset evaluation. Inference time measured on a single NVIDIA A100 (40GB).*
 
-**Strategy**:
-- Expand training data with more diverse content images, particularly in challenging semantic domains (human faces, complex objects)
-- Explore regularization and augmentation strategies that encourage learning transferable structural patterns
-- Balance dataset composition to prevent memorization of limited content priors
+**Observations.**
+- Both StyleVAR variants consistently outperform AdaIN on every quality-oriented metric across all three datasets, with the largest gains on SSIM (up to **+0.26** on OmniStyle) and LPIPS (up to **−0.28** on OmniStyle) — evidence that the autoregressive multi-scale formulation preserves content structure far more faithfully than channel-wise feature statistics matching.
+- GRPO improves over the SFT checkpoint on the majority of metrics on every dataset, most notably DreamSim and CLIP similarity — the two signals aligned with the reinforcement reward — confirming that reward-guided fine-tuning sharpens the SFT-learned style/content trade-off without destabilizing the policy.
+- AdaIN retains a roughly two-orders-of-magnitude advantage in inference cost, reflecting the gap between a single feed-forward pass and a 10-scale autoregressive procedure.
 
-### 5.2 Classifier-Free Style Guidance
+### Training Dynamics
 
-**Objective**: Enable user-controllable style strength at inference time
+![SFT Training Dynamics](assets/training_dynamics.png)
 
-**Approach**: Extend StyleVAR with classifier-free guidance mechanism:
-1. **Training**: Occasionally drop style conditioning to teach the model both style-conditioned and style-agnostic predictions
-2. **Inference**: Interpolate between style-conditioned and unconditional predictions when sampling tokens
-3. **User Control**: Continuous dial for trading off content fidelity against stylistic intensity
-
-**Benefits**: Complements existing blended attention design by providing straightforward runtime control without retraining
-
-### 5.3 GRPO-Driven Unsupervised Learning
-
-**Objective**: Transcend limitations of supervised training with paired ground truth
-
-**Methodology**: Implement second-stage unsupervised fine-tuning via **Group Relative Policy Optimization (GRPO)**:
-
-#### GRPO Framework for Visual Generation
-
-1. **Policy Network**: StyleVAR model serves as the policy
-2. **Sampling**: For each content-style pair, sample a group of diverse outputs
-3. **Reward Signal**: Evaluate outputs using perceptual metrics:
-   - VGG-based style loss
-   - VGG-based content loss
-   - LPIPS perceptual distance
-   - SSIM structural similarity
-4. **Optimization**: Optimize policy to favor outputs with higher relative rewards within the group
-
-#### Advantages Over Actor-Critic Methods
-
-- **Memory Efficiency**: Eliminates need for separate Critic model
-- **Scalability**: Allocate more resources to batch size and context length
-- **Direct Optimization**: Minimize perceptual loss directly through non-differentiable discrete sampling
-
-**Expected Impact**: Enable the model to learn perceptual objectives without relying on paired ground truth, potentially improving generalization and reducing dataset bias.
-
-### 5.4 Adaptive Blending Strategies
-
-**Objective**: Data-driven strategies for setting or adapting the blending coefficient $\alpha$
-
-**Approaches**:
-- Learn scale-dependent and content-dependent blending coefficients
-- Automatic adjustment to different content-style pairs
-- Reduce failure cases in underrepresented or structurally sensitive domains
+*Figure 2. Stage 1 SFT loss (left) and top-$k$ accuracy (right) across global iterations.*
 
 ---
 
-## ✅ Project Roadmap
+## Limitations
 
-### Completed Tasks
-
-#### Foundation & Architecture
-- [x] Literature review on VAR, VQ-VAE, and style transfer methods
-- [x] Design blended cross-attention mechanism
-- [x] Implement StyleVAR transformer architecture
-- [x] Adapt VAR framework for dual-stream conditioning (style + content)
-- [x] Initialize from pretrained VAR checkpoint
-
-#### Data & Training Pipeline
-- [x] Prepare OmniStyle-150K dataset
-- [x] Implement data augmentation (rotation, brightness, cropping)
-- [x] Implement teacher-forcing training strategy
-- [x] Configure distributed training on 2× A100 GPUs
-- [x] Implement gradient accumulation for effective batch size 1024
-- [x] Fine-tune for 8 epochs with learning rate schedule
-
-#### Inference & Evaluation
-- [x] Implement autoregressive inference pipeline
-- [x] Implement progressive feature accumulation
-- [x] Integrate top-k/top-p sampling
-- [x] Benchmark against AdaIN baseline (N=500)
-- [x] Evaluate on WikiArt (style) and MS-COCO (content)
-- [x] Compute metrics: Style Loss, Content Loss, SSIM, LPIPS
-- [x] Qualitative analysis on validation set
-- [x] Generate visualization figures
-
-#### Documentation & Reporting
-- [x] Write final project report
-- [x] Document methodology and attention design rationale
-- [x] Analyze limitations and generalization gap
-- [x] Prepare training dynamics plots
-- [x] Create qualitative result figures
-- [x] Update README with academic refinement
-
-### Pending Tasks
-
-#### Generalization Improvements
-- [ ] Expand dataset with more diverse content images
-- [ ] Augment training data with human face domain
-- [ ] Implement advanced regularization strategies
-- [ ] Test on diverse internet image benchmarks
-- [ ] Conduct ablation study on data diversity
-
-#### Controllability Enhancements
-- [ ] Implement classifier-free style guidance
-- [ ] Train with conditional dropout for style conditioning
-- [ ] Add inference-time style strength control
-- [ ] Implement adaptive blending coefficient learning
-- [ ] User study on controllability effectiveness
-
-#### Reinforcement Learning Integration (GRPO)
-- [ ] Implement GRPO training framework for visual generation
-- [ ] Design group sampling strategy for diverse outputs
-- [ ] Implement perceptual reward functions (VGG, LPIPS, SSIM)
-- [ ] Configure reward aggregation and normalization
-- [ ] Second-stage unsupervised fine-tuning with GRPO
-- [ ] Evaluate GRPO impact on perceptual quality
-- [ ] Compare GRPO vs. supervised baseline
-- [ ] Memory profiling and optimization for GRPO
-
-#### Efficiency & Deployment
-- [ ] Profile computational bottlenecks
-- [ ] Explore model distillation for faster inference
-- [ ] Implement mixed-precision inference
-- [ ] Optimize memory usage during generation
-- [ ] Deploy demo web interface
-- [ ] Create user-friendly inference scripts
-
-#### Extended Evaluation
-- [ ] Benchmark on additional style transfer datasets
-- [ ] Human evaluation study (perceptual quality, preference)
-- [ ] Ablation study on blending coefficient $\alpha$
-- [ ] Ablation study on number of scales $K$
-- [ ] Compare against diffusion-based style transfer methods
-- [ ] Analyze failure cases systematically
+- **Generalization gap on internet images.** OmniStyle-150K's ~150K triplets come from only ~1,800 unique content images. At 600M parameters, StyleVAR partially memorizes this limited content pool rather than learning a fully generalized content representation.
+- **Human faces.** Facial topology is structurally more sensitive and perceptually more scrutinized than natural scenes; the model performs well on landscapes and architecture but struggles on faces.
+- **Sampling cost.** 10-scale autoregressive decoding is ~128$\times$ slower than AdaIN. Closing this gap through distillation or parallel decoding is left to future work.
 
 ---
 
-## 👥 Team Contributions
+## Repository Layout
 
-**Liqi Jing**: Implementing the blended attention module for StyleVAR and benchmark evaluation
-
-**Dingming Zhang**: Implementing the training framework and LoRA fine-tuning pipeline
-
-**Peinian Li**: Implementing the dataset loader and visualization tools
+```
+StyleVAR/
+├── train/                       # training entry points
+│   ├── train_grpo.py            # Stage 2 GRPO loop
+│   ├── train_sft.py             # Stage 1 SFT loop
+│   └── sft_trainer.py
+├── eval/                        # evaluation and inference
+│   ├── eval_grpo.py             # metrics on OmniStyle / ImagePulse / COCO+WikiArt
+│   ├── infer_grpo.py            # qualitative side-by-side generation
+│   ├── adain.py                 # AdaIN baseline
+│   └── {content_style_loss,LPIPS,SSIM}.py
+├── scripts/                     # one-click shell + merge utilities
+│   ├── run_grpo_v5.sh
+│   ├── run_eval.sh
+│   └── merge_grpo_lora.py
+├── models/                      # StyleVAR transformer + VQ-VAE
+├── utils/                       # LoRA, data, AMP, LR control
+│   └── lora.py                  # canonical LoRA + checkpoint helpers
+├── assets/                      # paper figures (sample.png, framework.png, ...)
+├── GRPO.md                      # detailed GRPO design notes
+└── README.md
+```
 
 ---
 
-## 📚 References
-
-[1] Tian, K., Jiang, Y., Yuan, Z., Peng, B., & Wang, L. (2024). Visual Autoregressive Modeling: Scalable Image Generation via Next-Scale Prediction. In *Advances in Neural Information Processing Systems 37 (NeurIPS 2024)*.
-
-[2] Wang, Y., Liu, R., Lin, J., Liu, F., Yi, Z., Wang, Y., & Ma, R. (2025). OmniStyle: Filtering High Quality Style Transfer Data at Scale. In *2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)*.
-
-[3] Zhang, Y., Huang, N., Tang, F., Huang, H., Ma, C., Dong, W., & Xu, C. (2023). Inversion-Based Style Transfer with Diffusion Models. In *2023 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)* (pp. 10077–10086).
-
-[4] Huang, X., & Belongie, S. (2017). Arbitrary Style Transfer in Real-time with Adaptive Instance Normalization. In *ICCV 2017*.
-
-[5] Lin, T. Y., Maire, M., Belongie, S., Hays, J., Perona, P., Ramanan, D., ... Zitnick, C. L. (2014). Microsoft COCO: Common Objects in Context. In *European Conference on Computer Vision* (pp. 740-755).
-
-[6] WikiArt. (n.d.). WikiArt: Visual Art Encyclopedia. https://www.wikiart.org/
-
-[7] DiffSynth-Studio. ImagePulse-StyleTransfer [Dataset]. ModelScope. https://www.modelscope.cn/datasets/DiffSynth-Studio/ImagePulse-StyleTransfer
-
----
-
-## 📄 Citation
-
-If you find this work useful for your research, please consider citing:
+## Citation
 
 ```bibtex
-@article{jing2025stylevar,
-  title={StyleVAR: Controllable Image Style Transfer via Visual Autoregressive Modeling},
-  author={Jing, Liqi and Zhang, Dingming and Li, Peinian},
-  journal={Duke University Course Project},
-  year={2025}
+@article{jing2026stylevar,
+  title   = {StyleVAR: Controllable Image Style Transfer via Visual Autoregressive Modeling},
+  author  = {Jing, Liqi and Zhang, Dingming and Li, Peinian and Zhu, Lichen},
+  year    = {2026},
+  note    = {Duke University}
 }
 ```
 
 ---
 
-## 📧 Contact
+## References
 
-For questions or collaboration opportunities, please contact:
-- Liqi Jing: [liqi.jing@duke.edu](mailto:liqi.jing@duke.edu)
-- GitHub Issues: [https://github.com/Senfier-LiqiJing/StyleVAR/issues](https://github.com/Senfier-LiqiJing/StyleVAR/issues)
+[1] Tian, K., Jiang, Y., Yuan, Z., Peng, B., & Wang, L. (2024). *Visual Autoregressive Modeling: Scalable Image Generation via Next-Scale Prediction.* NeurIPS 2024.
+
+[2] Wang, Y., Liu, R., Lin, J., Liu, F., Yi, Z., Wang, Y., & Ma, R. (2025). *OmniStyle: Filtering High Quality Style Transfer Data at Scale.* CVPR 2025.
+
+[3] Zhang, Y., Huang, N., Tang, F., Huang, H., Ma, C., Dong, W., & Xu, C. (2023). *Inversion-Based Style Transfer with Diffusion Models.* CVPR 2023.
+
+[4] DiffSynth-Studio. *ImagePulse-StyleTransfer* [Dataset]. ModelScope.
+
+[5] Lin, T. Y., Maire, M., Belongie, S., et al. (2014). *Microsoft COCO: Common Objects in Context.* ECCV 2014.
+
+[6] WikiArt. *WikiArt: Visual Art Encyclopedia.* https://www.wikiart.org/
+
+[7] DeepSeek-AI, Guo, D., Yang, D., et al. (2025). *DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning.* arXiv:2501.12948.
+
+[8] Sun, S., Qu, L., Zhang, H., et al. (2026). *VAR RL Done Right: Tackling Asynchronous Policy Conflicts in Visual Autoregressive Generation.* arXiv:2601.02256.
+
+[9] Fu, S., Tamir, N., Sundaram, S., Chai, L., Zhang, R., Dekel, T., & Isola, P. (2023). *DreamSim: Learning New Dimensions of Human Visual Similarity Using Synthetic Data.* NeurIPS 2023.
+
+[10] Huang, X., & Belongie, S. (2017). *Arbitrary Style Transfer in Real-time with Adaptive Instance Normalization.* ICCV 2017.
 
 ---
 
-## 📜 License
+## License
 
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
+Released under the Apache 2.0 License — see [LICENSE](LICENSE).
 
----
-
-**Acknowledgments**: This work builds upon the Visual Autoregressive Modeling (VAR) framework and utilizes the OmniStyle-150K dataset. We thank the authors for making their code and data publicly available
+**Acknowledgments.** This work builds on the Visual Autoregressive Modeling (VAR) framework and uses the OmniStyle-150K and ImagePulse-StyleTransfer datasets. We thank the authors for releasing their code and data.
