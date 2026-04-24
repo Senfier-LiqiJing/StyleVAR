@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Project Page](https://img.shields.io/badge/Project-Page-green)](https://github.com/Senfier-LiqiJing/StyleVAR)
-[![OpenReview](https://img.shields.io/badge/OpenReview-UHW3PgLUsa-8B0000)](https://openreview.net/forum?id=UHW3PgLUsa)
+[![arXiv](https://img.shields.io/badge/arXiv-2604.21052-b31b1b.svg)](https://arxiv.org/abs/2604.21052)
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Model-yellow)](https://huggingface.co/Senfier-LiqiJing/StyleVAR)
 
 ![StyleVAR Qualitative Results](assets/sample.png)
